@@ -14,27 +14,38 @@ use tracing::info;
 
 /// 智能检测前端资源目录
 /// 按优先级尝试以下路径：
-/// 1. ./frontend/dist - GitHub 打包后的标准路径（生产环境）
-/// 2. ../frontend/dist - 开发环境，源码目录结构
-/// 3. /app/frontend/dist - Docker 容器标准路径
-/// 4. ./dist - 备选路径（手动部署）
-/// 5. {exe_dir}/frontend/dist - 相对于可执行文件的路径
+/// 1. ./frontend/dist - 开发环境标准路径
+/// 2. ./frontend - GitHub Actions 打包路径（dist 内容直接在 frontend 下）
+/// 3. ../frontend/dist - 开发环境，源码目录结构
+/// 4. ../frontend - GitHub Actions 打包路径（上级目录）
+/// 5. /app/frontend/dist - Docker 容器标准路径
+/// 6. /app/frontend - Docker 容器 GitHub 打包路径
+/// 7. ./dist - 备选路径（手动部署）
+/// 8. {exe_dir}/frontend/dist - 相对于可执行文件的路径
+/// 9. {exe_dir}/frontend - 相对于可执行文件的 GitHub 打包路径
 fn detect_frontend_dir() -> PathBuf {
     let mut candidates = vec![
-        // 1. GitHub 打包后的标准路径（生产环境）
+        // 1. 开发环境标准路径
         PathBuf::from("./frontend/dist"),
-        // 2. 开发环境路径
+        // 2. GitHub Actions 打包路径（dist 内容直接在 frontend 下）
+        PathBuf::from("./frontend"),
+        // 3. 开发环境，源码目录结构
         PathBuf::from("../frontend/dist"),
-        // 3. Docker 容器路径
+        // 4. GitHub Actions 打包路径（上级目录）
+        PathBuf::from("../frontend"),
+        // 5. Docker 容器标准路径
         PathBuf::from("/app/frontend/dist"),
-        // 4. 备选路径（手动部署时可能使用）
+        // 6. Docker 容器 GitHub 打包路径
+        PathBuf::from("/app/frontend"),
+        // 7. 备选路径（手动部署时可能使用）
         PathBuf::from("./dist"),
     ];
 
-    // 5. 可执行文件所在目录的 frontend/dist
+    // 8-9. 可执行文件所在目录的 frontend/dist 和 frontend
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
             candidates.push(exe_dir.join("frontend/dist"));
+            candidates.push(exe_dir.join("frontend"));
             candidates.push(exe_dir.join("dist"));
         }
     }
