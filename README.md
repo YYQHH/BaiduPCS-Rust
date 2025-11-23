@@ -339,9 +339,41 @@ cors_origins = ["*"]
 
 [download]
 download_dir = "downloads"
-concurrent_chunks = 8
+max_global_threads = 10
+max_concurrent_tasks = 2
 chunk_size_mb = 10
 max_retries = 3
+```
+
+### 📋 配置参数说明
+
+#### 下载配置参数
+
+- **`max_global_threads`**: 全局最大线程数（所有下载任务共享的并发分片数）
+- **`max_concurrent_tasks`**: 最大同时下载文件数
+- **`chunk_size_mb`**: 每个分片的大小（单位: MB）
+- **`max_retries`**: 下载失败后的最大重试次数
+
+#### 普通用户配置建议
+
+普通用户请将**全局最大线程数**（`max_global_threads`）和**最大同时下载数**（`max_concurrent_tasks`）都设置为 1。
+
+```toml
+[download]
+max_global_threads = 1
+max_concurrent_tasks = 1
+```
+
+**⚠️ 注意**：调大线程数只会在短时间内提升下载速度，且极易很快触发限速，导致几小时至几天内账号在各客户端都接近 0 速。
+
+#### SVIP 用户配置建议
+
+SVIP 用户建议**全局最大线程数**（`max_global_threads`）设置为 10 以上，根据实际带宽可调大，但不建议超过 20。可以配合**最大同时下载数**（`max_concurrent_tasks`）调整，**注意最大同时下载数越大不代表速度越快**。
+
+```toml
+[download]
+max_global_threads = 10    # 建议 10-20
+max_concurrent_tasks = 2    # 可根据需求调整
 ```
 
 ---
