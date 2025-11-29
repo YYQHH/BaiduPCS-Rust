@@ -1992,7 +1992,12 @@ mod tests {
             bduss: "mock_bduss".to_string(),
             stoken: Some("mock_stoken".to_string()),
             ptoken: Some("mock_ptoken".to_string()),
+            baiduid: Some("mock_baiduid".to_string()),
+            passid: Some("mock_passid".to_string()),
             cookies: Some("BDUSS=mock_bduss".to_string()),
+            panpsc: Some("mock_panpsc".to_string()),
+            csrf_token: Some("mock_csrf".to_string()),
+            bdstoken: Some("mock_bdstoken".to_string()),
             login_time: 0,
         }
     }

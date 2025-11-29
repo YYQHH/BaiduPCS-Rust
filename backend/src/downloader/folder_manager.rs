@@ -22,8 +22,8 @@ pub struct FolderDownloadManager {
     download_manager: Arc<RwLock<Option<Arc<DownloadManager>>>>,
     /// 网盘客户端（延迟初始化）
     netdisk_client: Arc<RwLock<Option<Arc<NetdiskClient>>>>,
-    /// 下载目录
-    download_dir: PathBuf,
+    /// 下载目录（使用 RwLock 支持动态更新）
+    download_dir: Arc<RwLock<PathBuf>>,
 }
 
 impl FolderDownloadManager {
@@ -34,7 +34,7 @@ impl FolderDownloadManager {
             cancellation_tokens: Arc::new(RwLock::new(HashMap::new())),
             download_manager: Arc::new(RwLock::new(None)),
             netdisk_client: Arc::new(RwLock::new(None)),
-            download_dir,
+            download_dir: Arc::new(RwLock::new(download_dir)),
         }
     }
 
@@ -185,6 +185,22 @@ impl FolderDownloadManager {
         *nc = Some(client);
     }
 
+    /// 更新下载目录
+    ///
+    /// 当配置中的 download_dir 改变时调用此方法
+    /// 注意：只影响新创建的文件夹下载任务，已存在的任务不受影响
+    pub async fn update_download_dir(&self, new_dir: PathBuf) {
+        let mut dir = self.download_dir.write().await;
+        if *dir != new_dir {
+            info!(
+                "更新文件夹下载目录: {:?} -> {:?}",
+                *dir,
+                new_dir
+            );
+            *dir = new_dir;
+        }
+    }
+
     /// 创建文件夹下载任务
     pub async fn create_folder_download(&self, remote_path: String) -> Result<String> {
         // 计算本地路径（使用文件夹名称）
@@ -193,7 +209,9 @@ impl FolderDownloadManager {
             .split('/')
             .last()
             .unwrap_or("download");
-        let local_root = self.download_dir.join(folder_name);
+        let download_dir = self.download_dir.read().await;
+        let local_root = download_dir.join(folder_name);
+        drop(download_dir);
 
         let folder = FolderDownload::new(remote_path.clone(), local_root);
         let folder_id = folder.id.clone();
@@ -271,7 +289,7 @@ impl FolderDownloadManager {
             &remote_root,
             &local_root,
         )
-        .await?;
+            .await?;
 
         // 扫描完成，更新状态
         {
@@ -359,7 +377,7 @@ impl FolderDownloadManager {
                         &item.path,
                         local_root,
                     )
-                    .await?;
+                        .await?;
                 } else {
                     // 计算相对路径
                     let relative_path = item
