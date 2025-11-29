@@ -26,11 +26,13 @@ services:
     networks:
       - baidu-network
     healthcheck:
+      # start_period: 30s - 给 Rust 应用足够的启动时间（初始化 AppState、加载会话等）
+      # timeout: 5s - 增加超时时间，避免启动阶段的慢响应导致失败
       test: ["CMD", "curl", "-f", "http://localhost:18888/health"]
       interval: 30s
-      timeout: 3s
+      timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 30s
     # 资源限制
     deploy:
       resources:

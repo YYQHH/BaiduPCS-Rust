@@ -2,7 +2,7 @@ use crate::auth::UserAuth;
 use crate::downloader::{ChunkScheduler, DownloadEngine, DownloadTask, TaskScheduleInfo, TaskStatus, calculate_task_max_chunks};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -20,8 +20,8 @@ pub struct DownloadManager {
     waiting_queue: Arc<RwLock<VecDeque<String>>>,
     /// 下载引擎
     engine: Arc<DownloadEngine>,
-    /// 默认下载目录
-    download_dir: PathBuf,
+    /// 默认下载目录（使用 RwLock 支持动态更新）
+    download_dir: Arc<RwLock<PathBuf>>,
     /// 全局分片调度器
     chunk_scheduler: ChunkScheduler,
     /// 最大同时下载任务数
@@ -62,7 +62,7 @@ impl DownloadManager {
             cancellation_tokens: Arc::new(RwLock::new(HashMap::new())),
             waiting_queue: Arc::new(RwLock::new(VecDeque::new())),
             engine,
-            download_dir,
+            download_dir: Arc::new(RwLock::new(download_dir)),
             chunk_scheduler,
             max_concurrent_tasks,
         };
@@ -81,7 +81,9 @@ impl DownloadManager {
         filename: String,
         total_size: u64,
     ) -> Result<String> {
-        let local_path = self.download_dir.join(&filename);
+        let download_dir = self.download_dir.read().await;
+        let local_path = download_dir.join(&filename);
+        drop(download_dir);
 
         // 检查文件是否已存在
         if local_path.exists() {
@@ -682,8 +684,32 @@ impl DownloadManager {
     }
 
     /// 获取下载目录
-    pub fn download_dir(&self) -> &Path {
-        &self.download_dir
+    pub async fn download_dir(&self) -> PathBuf {
+        self.download_dir.read().await.clone()
+    }
+
+    /// 动态更新下载目录
+    ///
+    /// 当配置中的 download_dir 改变时调用此方法
+    /// 注意：只影响新创建的下载任务，已存在的任务不受影响
+    pub async fn update_download_dir(&self, new_dir: PathBuf) {
+        let mut dir = self.download_dir.write().await;
+        if *dir != new_dir {
+            // 确保新目录存在
+            if !new_dir.exists() {
+                if let Err(e) = std::fs::create_dir_all(&new_dir) {
+                    error!("创建新下载目录失败: {:?}, 错误: {}", new_dir, e);
+                    return;
+                }
+                info!("✓ 新下载目录已创建: {:?}", new_dir);
+            }
+            info!(
+                "更新下载目录: {:?} -> {:?}",
+                *dir,
+                new_dir
+            );
+            *dir = new_dir;
+        }
     }
 
     /// 动态更新全局最大线程数
@@ -808,7 +834,12 @@ mod tests {
             bduss: "mock_bduss".to_string(),
             stoken: Some("mock_stoken".to_string()),
             ptoken: Some("mock_ptoken".to_string()),
+            baiduid: Some("mock_baiduid".to_string()),
+            passid: Some("mock_passid".to_string()),
             cookies: Some("BDUSS=mock_bduss".to_string()),
+            panpsc: Some("mock_panpsc".to_string()),
+            csrf_token: Some("mock_csrf".to_string()),
+            bdstoken: Some("mock_bdstoken".to_string()),
             login_time: 0,
         }
     }
@@ -819,7 +850,7 @@ mod tests {
         let user_auth = create_mock_user_auth();
         let manager = DownloadManager::new(user_auth, temp_dir.path().to_path_buf()).unwrap();
 
-        assert_eq!(manager.download_dir(), temp_dir.path());
+        assert_eq!(manager.download_dir().await, temp_dir.path());
         assert_eq!(manager.get_all_tasks().await.len(), 0);
     }
 

@@ -106,12 +106,19 @@ pub async fn reset_to_recommended(
     if let Some(manager) = manager_guard.as_ref() {
         manager.update_max_threads(config.download.max_global_threads);
         manager.update_max_concurrent_tasks(config.download.max_concurrent_tasks).await;
+        // 更新下载目录
+        manager.update_download_dir(config.download.download_dir.clone()).await;
         info!(
-            "✓ 下载管理器已更新为推荐配置: 线程数={}, 最大任务数={}",
-            config.download.max_global_threads, config.download.max_concurrent_tasks
+            "✓ 下载管理器已更新为推荐配置: 线程数={}, 最大任务数={}, 下载目录={:?}",
+            config.download.max_global_threads, config.download.max_concurrent_tasks, config.download.download_dir
         );
     }
     drop(manager_guard);
+
+    // 🔧 动态更新文件夹下载管理器的下载目录
+    app_state.folder_download_manager
+        .update_download_dir(config.download.download_dir.clone())
+        .await;
 
     // 🔧 动态更新上传管理器配置
     let upload_manager_guard = app_state.upload_manager.read().await;
@@ -179,14 +186,25 @@ pub async fn update_config(
     if let Some(manager) = manager_guard.as_ref() {
         manager.update_max_threads(new_config.download.max_global_threads);
         manager.update_max_concurrent_tasks(new_config.download.max_concurrent_tasks).await;
+        // 更新下载目录
+        manager.update_download_dir(new_config.download.download_dir.clone()).await;
         info!(
-            "✓ 下载管理器配置已动态更新: 线程数={}, 最大任务数={}",
-            new_config.download.max_global_threads, new_config.download.max_concurrent_tasks
+            "✓ 下载管理器配置已动态更新: 线程数={}, 最大任务数={}, 下载目录={:?}",
+            new_config.download.max_global_threads, new_config.download.max_concurrent_tasks, new_config.download.download_dir
         );
     } else {
         info!("下载管理器未初始化，配置将在下次登录时生效");
     }
     drop(manager_guard);
+
+    // 🔧 动态更新文件夹下载管理器的下载目录
+    app_state.folder_download_manager
+        .update_download_dir(new_config.download.download_dir.clone())
+        .await;
+    info!(
+        "✓ 文件夹下载管理器下载目录已更新: {:?}",
+        new_config.download.download_dir
+    );
 
     // 🔧 动态更新上传管理器配置（无需重启，不影响正在进行的任务）
     let upload_manager_guard = app_state.upload_manager.read().await;

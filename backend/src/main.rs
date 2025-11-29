@@ -1,8 +1,9 @@
 use axum::{
     routing::{delete, get, post, put},
-    Router,
+    Json, Router,
 };
 use baidu_netdisk_rust::{server::handlers, AppState};
+use serde::Serialize;
 use std::path::PathBuf;
 use tower::ServiceBuilder;
 use tower_http::{
@@ -163,10 +164,25 @@ async fn main() -> anyhow::Result<()> {
     let static_service = ServeDir::new(&frontend_dir)
         .not_found_service(ServeFile::new(&index_html_path));
 
+    // 健康检查响应结构
+    #[derive(Serialize)]
+    struct HealthResponse {
+        status: String,
+        service: String,
+    }
+
+    // 健康检查处理器
+    async fn health_check() -> Json<HealthResponse> {
+        Json(HealthResponse {
+            status: "ok".to_string(),
+            service: "baidu-netdisk-rust".to_string(),
+        })
+    }
+
     // 构建完整应用
     let app = Router::new()
         .nest("/api/v1", api_routes)
-        .route("/health", get(|| async { "OK" }))
+        .route("/health", get(health_check))
         .fallback_service(static_service)
         .layer(middleware);
 

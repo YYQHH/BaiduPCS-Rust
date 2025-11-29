@@ -74,7 +74,9 @@ ENV RUST_BACKTRACE=1
 EXPOSE 18888
 
 # 健康检查
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+# start-period=30s: 给 Rust 应用足够的启动时间（初始化 AppState、加载会话等）
+# timeout=5s: 增加超时时间，避免启动阶段的慢响应导致失败
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:18888/health || exit 1
 
 # 启动应用
