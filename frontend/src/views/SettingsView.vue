@@ -316,6 +316,28 @@
               </el-alert>
             </el-card>
 
+            <!-- 转存配置 -->
+            <el-card class="setting-card" shadow="hover">
+              <template #header>
+                <div class="card-header">
+                  <el-icon :size="20" color="#909399">
+                    <Share />
+                  </el-icon>
+                  <span>转存配置</span>
+                </div>
+              </template>
+
+              <el-form-item label="默认行为">
+                <el-radio-group v-model="transferBehavior">
+                  <el-radio value="transfer_only">仅转存到网盘</el-radio>
+                  <el-radio value="transfer_and_download">转存后自动下载</el-radio>
+                </el-radio-group>
+                <div class="form-tip">
+                  选择"转存后自动下载"时，会根据下载配置决定是否弹出文件选择器
+                </div>
+              </el-form-item>
+            </el-card>
+
             <!-- 关于信息 -->
             <el-card class="setting-card" shadow="hover">
               <template #header>
@@ -374,7 +396,9 @@ import {
   InfoFilled,
   User,
   Files,
+  Share,
 } from '@element-plus/icons-vue'
+import { getTransferConfig, updateTransferConfig } from '@/api/config'
 
 const configStore = useConfigStore()
 
@@ -385,6 +409,7 @@ const resetting = ref(false)
 const formRef = ref<FormInstance>()
 const formData = ref<AppConfig | null>(null)
 const recommended = ref<any>(null)
+const transferBehavior = ref('transfer_only')
 
 // 滑块标记
 const threadMarks = reactive({
@@ -474,6 +499,14 @@ async function loadConfig() {
     } catch (error) {
       console.warn('获取推荐配置失败:', error)
     }
+
+    // 加载转存配置
+    try {
+      const transferConfig = await getTransferConfig()
+      transferBehavior.value = transferConfig.default_behavior || 'transfer_only'
+    } catch (error) {
+      console.warn('获取转存配置失败:', error)
+    }
   } catch (error: any) {
     ElMessage.error('加载配置失败: ' + (error.message || '未知错误'))
   } finally {
@@ -519,6 +552,14 @@ async function handleSave() {
 
     saving.value = true
     await configStore.saveConfig(formData.value)
+
+    // 同时保存转存配置
+    try {
+      await updateTransferConfig({ default_behavior: transferBehavior.value })
+    } catch (error) {
+      console.warn('保存转存配置失败:', error)
+    }
+
     ElMessage.success('配置已保存')
 
     // 重新加载推荐配置以更新警告

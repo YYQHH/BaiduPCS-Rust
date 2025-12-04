@@ -51,11 +51,19 @@ export interface UploadConfig {
   recent_directory?: string        // 最近使用的上传源目录
 }
 
+/// 转存配置
+export interface TransferConfig {
+  default_behavior: string      // 'transfer_only' | 'transfer_and_download'
+  recent_save_fs_id?: number    // 最近使用的网盘目录 fs_id
+  recent_save_path?: string     // 最近使用的网盘目录路径
+}
+
 /// 应用配置
 export interface AppConfig {
   server: ServerConfig
   download: DownloadConfig
   upload: UploadConfig
+  transfer?: TransferConfig
 }
 
 /// VIP 推荐配置
@@ -189,5 +197,32 @@ export interface SetDefaultDirRequest {
  */
 export async function setDefaultDownloadDir(req: SetDefaultDirRequest): Promise<string> {
   return apiClient.post('/config/default-download-dir', req)
+}
+
+// ============================================
+// 转存配置 API
+// ============================================
+
+/**
+ * 获取转存配置
+ */
+export async function getTransferConfig(): Promise<TransferConfig> {
+  return apiClient.get('/config/transfer')
+}
+
+/**
+ * 更新转存配置请求
+ */
+export interface UpdateTransferConfigRequest {
+  default_behavior?: string
+  recent_save_fs_id?: number
+  recent_save_path?: string
+}
+
+/**
+ * 更新转存配置
+ */
+export async function updateTransferConfig(req: UpdateTransferConfigRequest): Promise<string> {
+  return apiClient.put('/config/transfer', req)
 }
 

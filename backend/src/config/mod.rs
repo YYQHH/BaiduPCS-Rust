@@ -23,6 +23,9 @@ pub struct AppConfig {
     /// 上传配置
     #[serde(default)]
     pub upload: UploadConfig,
+    /// 转存配置
+    #[serde(default)]
+    pub transfer: TransferConfig,
     /// 文件系统配置
     #[serde(default)]
     pub filesystem: FilesystemConfig,
@@ -206,6 +209,37 @@ impl Default for UploadConfig {
             max_retries: 3,
             skip_hidden_files: false,   // 默认不跳过隐藏文件
             recent_directory: None,     // 默认无最近目录
+        }
+    }
+}
+
+/// 转存配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferConfig {
+    /// 转存后默认行为：transfer_only / transfer_and_download
+    #[serde(default = "default_transfer_behavior")]
+    pub default_behavior: String,
+
+    /// 最近使用的网盘目录 fs_id（转存目标位置）
+    #[serde(default)]
+    pub recent_save_fs_id: Option<u64>,
+
+    /// 最近使用的网盘目录路径（与 fs_id 对应）
+    #[serde(default)]
+    pub recent_save_path: Option<String>,
+}
+
+/// 默认转存行为：仅转存
+fn default_transfer_behavior() -> String {
+    "transfer_only".to_string()
+}
+
+impl Default for TransferConfig {
+    fn default() -> Self {
+        Self {
+            default_behavior: default_transfer_behavior(),
+            recent_save_fs_id: None,
+            recent_save_path: None,
         }
     }
 }
@@ -498,6 +532,7 @@ impl Default for AppConfig {
                 cdn_refresh: CdnRefreshConfig::default(),
             },
             upload: UploadConfig::default(),
+            transfer: TransferConfig::default(),
             filesystem: FilesystemConfig::default(),
         }
     }

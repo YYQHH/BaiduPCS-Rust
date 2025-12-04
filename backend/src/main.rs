@@ -145,6 +145,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/uploads/batch", post(handlers::create_batch_upload))
         .route("/uploads/clear/completed", post(handlers::clear_completed_uploads))
         .route("/uploads/clear/failed", post(handlers::clear_failed_uploads))
+        // 转存API
+        .route("/transfers", post(handlers::create_transfer))
+        .route("/transfers", get(handlers::get_all_transfers))
+        .route("/transfers/:id", get(handlers::get_transfer))
+        .route("/transfers/:id", delete(handlers::delete_transfer))
+        .route("/transfers/:id/cancel", post(handlers::cancel_transfer))
         // 本地文件系统API
         .route("/fs/list", get(handlers::list_directory))
         .route("/fs/goto", get(handlers::goto_path))
@@ -157,6 +163,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/config/reset", post(handlers::reset_to_recommended))
         .route("/config/recent-dir", post(handlers::update_recent_dir))
         .route("/config/default-download-dir", post(handlers::set_default_download_dir))
+        // 转存配置API
+        .route("/config/transfer", get(handlers::get_transfer_config))
+        .route("/config/transfer", put(handlers::update_transfer_config))
         .with_state(app_state.clone());
 
     // 自动检测前端资源目录

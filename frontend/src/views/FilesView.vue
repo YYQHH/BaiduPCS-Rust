@@ -36,6 +36,10 @@
           <el-icon><Upload /></el-icon>
           上传
         </el-button>
+        <el-button type="warning" @click="showTransferDialog = true">
+          <el-icon><Share /></el-icon>
+          转存
+        </el-button>
         <el-button type="primary" @click="refreshFileList">
           <el-icon><Refresh /></el-icon>
           刷新
@@ -56,7 +60,7 @@
     />
 
     <!-- 文件列表 -->
-    <div class="file-list">
+    <div class="file-list" ref="fileListRef" @scroll="handleScroll">
       <el-table
           v-loading="loading"
           :data="fileList"
@@ -116,6 +120,15 @@
         </el-table-column>
       </el-table>
 
+      <!-- 加载更多提示 -->
+      <div v-if="loadingMore" class="loading-more">
+        <el-icon class="is-loading"><Loading /></el-icon>
+        <span>加载中...</span>
+      </div>
+      <div v-else-if="!hasMore && fileList.length > 0" class="no-more">
+        没有更多了
+      </div>
+
       <!-- 空状态 -->
       <el-empty v-if="!loading && fileList.length === 0" description="当前目录为空"/>
     </div>
@@ -165,6 +178,13 @@
         @confirm-download="handleConfirmDownload"
         @use-default="handleUseDefaultDownload"
     />
+
+    <!-- 转存对话框 -->
+    <TransferDialog
+        v-model="showTransferDialog"
+        :current-path="currentDir"
+        @success="handleTransferSuccess"
+    />
   </div>
 </template>
 
@@ -176,6 +196,7 @@ import {createDownload, createFolderDownload, createBatchDownload, type BatchDow
 import {createUpload, createFolderUpload} from '@/api/upload'
 import {getConfig, updateRecentDirDebounced, setDefaultDownloadDir, type DownloadConfig, type UploadConfig} from '@/api/config'
 import {FilePickerModal} from '@/components/FilePicker'
+import TransferDialog from '@/components/TransferDialog.vue'
 import type {FileEntry} from '@/api/filesystem'
 
 // 下载配置状态
@@ -186,8 +207,12 @@ const uploadConfig = ref<UploadConfig | null>(null)
 
 // 状态
 const loading = ref(false)
+const loadingMore = ref(false)
 const fileList = ref<FileItem[]>([])
 const currentDir = ref('/')
+const currentPage = ref(1)
+const hasMore = ref(true)
+const fileListRef = ref<HTMLElement | null>(null)
 const downloadingFolders = ref<Set<string>>(new Set())
 const createFolderDialogVisible = ref(false)
 const creatingFolder = ref(false)
@@ -206,6 +231,9 @@ const batchDownloading = ref(false)
 // 单文件下载（支持 ask_each_time）
 const pendingDownloadFile = ref<FileItem | null>(null)
 
+// 转存对话框状态
+const showTransferDialog = ref(false)
+
 // 路径分割
 const pathParts = computed(() => {
   if (currentDir.value === '/') return []
@@ -219,17 +247,53 @@ function getPathUpTo(index: number): string {
 }
 
 // 加载文件列表
-async function loadFiles(dir: string) {
-  loading.value = true
+async function loadFiles(dir: string, append: boolean = false) {
+  if (append) {
+    loadingMore.value = true
+  } else {
+    loading.value = true
+    currentPage.value = 1
+    hasMore.value = true
+  }
+
   try {
-    const data = await getFileList(dir)
-    fileList.value = data.list
-    currentDir.value = dir
+    const page = append ? currentPage.value : 1
+    const data = await getFileList(dir, page, 50)
+
+    if (append) {
+      fileList.value = [...fileList.value, ...data.list]
+    } else {
+      fileList.value = data.list
+      currentDir.value = dir
+    }
+
+    hasMore.value = data.has_more
+    currentPage.value = data.page
   } catch (error: any) {
     ElMessage.error(error.message || '加载文件列表失败')
     console.error('加载文件列表失败:', error)
   } finally {
     loading.value = false
+    loadingMore.value = false
+  }
+}
+
+// 加载下一页
+async function loadNextPage() {
+  if (loadingMore.value || !hasMore.value) return
+
+  currentPage.value++
+  await loadFiles(currentDir.value, true)
+}
+
+// 滚动事件处理
+function handleScroll(event: Event) {
+  const target = event.target as HTMLElement
+  const { scrollTop, scrollHeight, clientHeight } = target
+
+  // 当滚动到距离底部 100px 时加载更多
+  if (scrollHeight - scrollTop - clientHeight < 100) {
+    loadNextPage()
   }
 }
 
@@ -712,11 +776,22 @@ onMounted(() => {
   loadFiles('/')
   loadDownloadConfig()
 })
+
+// ============================================
+// 转存相关函数
+// ============================================
+
+// 转存成功处理
+function handleTransferSuccess(taskId: string) {
+  console.log('转存任务创建成功:', taskId)
+  // 刷新文件列表以显示转存后的文件
+  refreshFileList()
+}
 </script>
 
 <script lang="ts">
 // 图标导入
-export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Download} from '@element-plus/icons-vue'
+export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Download, Share, Loading} from '@element-plus/icons-vue'
 </script>
 
 <style scoped lang="scss">
@@ -758,6 +833,23 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
   flex: 1;
   padding: 20px;
   overflow: auto;
+}
+
+.loading-more {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  padding: 16px;
+  color: #909399;
+  font-size: 14px;
+}
+
+.no-more {
+  text-align: center;
+  padding: 16px;
+  color: #c0c4cc;
+  font-size: 14px;
 }
 
 .file-name {
