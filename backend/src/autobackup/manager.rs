@@ -676,13 +676,13 @@ impl AutoBackupManager {
                 }
             }
         }
-        
+
         // 删除所有备份任务（从内存和数据库）
         let task_ids: Vec<String> = self.tasks.iter()
             .filter(|t| t.config_id == id)
             .map(|t| t.id.clone())
             .collect();
-        
+
         tracing::info!("找到 {} 个关联的备份任务", task_ids.len());
         for task_id in task_ids {
             self.tasks.remove(&task_id);
@@ -935,7 +935,7 @@ impl AutoBackupManager {
                 BackupTaskStatus::Transferring | BackupTaskStatus::Paused
             )
         });
-        
+
         if has_active_task {
             tracing::info!(
                 "配置 {} 已有活跃任务在运行，跳过创建新任务 (trigger: {:?})",
@@ -1238,14 +1238,14 @@ impl AutoBackupManager {
                             Err(e) => {
                                 tracing::warn!("加密文件夹路径失败，使用原始路径: {}", e);
                                 format!("{}/{}",
-                                    config.remote_path.trim_end_matches('/'),
-                                    scanned_file.relative_path.to_string_lossy().replace('\\', "/"))
+                                        config.remote_path.trim_end_matches('/'),
+                                        scanned_file.relative_path.to_string_lossy().replace('\\', "/"))
                             }
                         }
                     } else {
                         format!("{}/{}",
-                            config.remote_path.trim_end_matches('/'),
-                            scanned_file.relative_path.to_string_lossy().replace('\\', "/"))
+                                config.remote_path.trim_end_matches('/'),
+                                scanned_file.relative_path.to_string_lossy().replace('\\', "/"))
                     };
 
                     let file_task = BackupFileTask {
@@ -1357,7 +1357,7 @@ impl AutoBackupManager {
 
         // 批量创建和启动所有上传任务（立即返回，不等待）
         let mut created_count = 0;
-        
+
         for file_task in file_tasks {
             // 检查任务是否被取消或暂停
             if let Some(task) = tasks.get(&task_id) {
@@ -1432,7 +1432,7 @@ impl AutoBackupManager {
                     if let Some(mut task) = tasks.get_mut(&task_id) {
                         task.pending_upload_task_ids.remove(upload_task_id);
                         task.transfer_task_map.remove(upload_task_id);
-                        
+
                         if let Some(ft) = task.pending_files.iter_mut().find(|f| f.id == file_task_id) {
                             ft.related_task_id = None;
                             ft.updated_at = Utc::now();
@@ -1483,20 +1483,20 @@ impl AutoBackupManager {
                     if let Some(mut task) = tasks.get_mut(&task_id) {
                         task.pending_upload_task_ids.insert(upload_task_id.clone());
                         task.transfer_task_map.insert(upload_task_id.clone(), file_task_id.clone());
-                        
+
                         // 更新文件任务的 related_task_id 和 backup_operation_type
                         if let Some(ft) = task.pending_files.iter_mut().find(|f| f.id == file_task_id) {
                             ft.related_task_id = Some(upload_task_id.clone());
                             ft.backup_operation_type = Some(super::task::BackupOperationType::Upload);
                             ft.updated_at = Utc::now();
-                            
+
                             // 持久化到数据库（关键：服务重启后可恢复）
                             if let Err(e) = persistence_manager.save_file_task(ft, &config.id) {
                                 tracing::warn!("持久化文件任务失败: {}", e);
                             }
                         }
                     }
-                    
+
                     created_count += 1;
                 }
                 Err(e) => {
@@ -1615,9 +1615,9 @@ impl AutoBackupManager {
         let restored_file_tasks: Vec<BackupFileTask> = {
             if let Some(task) = tasks.get(&task_id) {
                 // 检查 pending_files 是否非空且有 related_task_id
-                let has_restored_tasks = !task.pending_files.is_empty() 
+                let has_restored_tasks = !task.pending_files.is_empty()
                     && task.pending_files.iter().any(|ft| ft.related_task_id.is_some());
-                
+
                 if has_restored_tasks {
                     tracing::info!(
                         "检测到已恢复的下载文件任务，跳过扫描直接续传: task={}, files={}, with_related_id={}",
@@ -1643,7 +1643,7 @@ impl AutoBackupManager {
             Self::publish_status_changed_static(&ws_manager, &task_id, "preparing", "transferring");
 
             let mut created_count = 0;
-            
+
             for file_task in restored_file_tasks {
                 // 检查任务是否被取消或暂停
                 if let Some(task) = tasks.get(&task_id) {
@@ -1948,7 +1948,7 @@ impl AutoBackupManager {
 
         // 🔥 内存优化：分批扫描远程目录（每批最多 DOWNLOAD_SCAN_BATCH_SIZE 个文件）
         const DOWNLOAD_SCAN_BATCH_SIZE: usize = 1000;
-        
+
         tracing::info!(
             "下载备份任务分批扫描远程目录: task={}, path={}, batch_size={}",
             task_id, config.remote_path, DOWNLOAD_SCAN_BATCH_SIZE
@@ -1959,7 +1959,7 @@ impl AutoBackupManager {
         let mut total_file_count = 0usize;
         let mut batch_number = 0usize;
         let mut dirs_to_scan = vec![config.remote_path.clone()];
-        
+
         // 当前批次的文件缓冲区
         let mut current_batch: Vec<(BackupFileTask, u64)> = Vec::with_capacity(DOWNLOAD_SCAN_BATCH_SIZE);
 
@@ -2176,7 +2176,7 @@ impl AutoBackupManager {
 
         // 阶段 2：批量创建和启动所有下载任务（立即返回，不等待）
         let mut created_count = 0;
-        
+
         for (file_task, fs_id) in file_tasks {
             // 检查任务是否被取消或暂停
             if let Some(task) = tasks.get(&task_id) {
@@ -2246,20 +2246,20 @@ impl AutoBackupManager {
                     if let Some(mut task) = tasks.get_mut(&task_id) {
                         task.pending_download_task_ids.insert(download_task_id.clone());
                         task.transfer_task_map.insert(download_task_id.clone(), file_task_id.clone());
-                        
+
                         // 更新文件任务的 related_task_id 和 backup_operation_type
                         if let Some(ft) = task.pending_files.iter_mut().find(|f| f.id == file_task_id) {
                             ft.related_task_id = Some(download_task_id.clone());
                             ft.backup_operation_type = Some(super::task::BackupOperationType::Download);
                             ft.updated_at = Utc::now();
-                            
+
                             // 持久化到数据库（关键：服务重启后可恢复）
                             if let Err(e) = persistence_manager.save_file_task(ft, &config.id) {
                                 tracing::warn!("持久化文件任务失败: {}", e);
                             }
                         }
                     }
-                    
+
                     created_count += 1;
                 }
                 Err(e) => {
@@ -2605,7 +2605,7 @@ impl AutoBackupManager {
     /// 获取配置的任务列表（分页）
     pub fn list_tasks_by_config(&self, config_id: &str, page: usize, page_size: usize) -> (Vec<BackupTask>, usize) {
         let offset = (page.saturating_sub(1)) * page_size;
-        
+
         // 从 DB 查询
         let db_tasks = match self.persistence_manager.get_tasks_by_config(config_id, page_size, offset) {
             Ok(tasks) => tasks,
@@ -2614,13 +2614,13 @@ impl AutoBackupManager {
                 Vec::new()
             }
         };
-        
+
         // 获取总数
         let total = match self.persistence_manager.count_tasks_by_config(config_id) {
             Ok(count) => count,
             Err(_) => db_tasks.len(),
         };
-        
+
         // 用内存中的活跃任务覆盖
         let mut result = db_tasks;
         for task_ref in self.tasks.iter() {
@@ -2631,7 +2631,7 @@ impl AutoBackupManager {
                 }
             }
         }
-        
+
         (result, total)
     }
 
@@ -2705,7 +2705,7 @@ impl AutoBackupManager {
                 .filter(|(_, f)| f.status == status)
                 .map(|(i, _)| i)
                 .collect();
-            
+
             let total = filtered_indices.len();
             let start = (page - 1) * page_size;
             let end = std::cmp::min(start + page_size, total);
@@ -2750,7 +2750,7 @@ impl AutoBackupManager {
         // 先查内存（活跃任务）
         if let Some(task) = self.tasks.get(task_id) {
             let total = task.pending_files.len();
-            
+
             // 🔥 内存优化：创建索引数组并按状态排序，避免全量 clone
             let mut indices: Vec<usize> = (0..total).collect();
             indices.sort_by_key(|&i| Self::file_status_priority(&task.pending_files[i].status));
@@ -3758,7 +3758,7 @@ impl AutoBackupManager {
     // ==================== WebSocket 事件 ====================
 
     /// 设置 WebSocket 管理器
-    /// 
+    ///
     /// 使用 Weak 引用存储，避免循环引用导致的内存泄漏
     pub fn set_ws_manager(&self, ws_manager: Arc<WebSocketManager>) {
         let mut ws = self.ws_manager.write();
@@ -4096,6 +4096,19 @@ impl AutoBackupManager {
             // 重置旧任务的关键字段
             if let Some(mut task) = self.tasks.get_mut(&task_id) {
                 task.error_message = None;
+                // 🔥 修复：清理旧的待完成任务ID，避免与新创建的任务ID混淆
+                // 这些旧ID对应的下载/上传任务可能已经不存在了
+                let old_download_count = task.pending_download_task_ids.len();
+                let old_upload_count = task.pending_upload_task_ids.len();
+                task.pending_download_task_ids.clear();
+                task.pending_upload_task_ids.clear();
+                task.transfer_task_map.clear();
+                if old_download_count > 0 || old_upload_count > 0 {
+                    tracing::info!(
+                        "复用任务时清理旧的待完成任务ID: task={}, old_download={}, old_upload={}",
+                        task_id, old_download_count, old_upload_count
+                    );
+                }
             }
 
             if let Some(task) = self.tasks.get(&task_id) {
@@ -4504,6 +4517,7 @@ impl AutoBackupManager {
             encrypted: bool,
             encrypted_name: Option<String>,
             head_md5: Option<String>,
+            fs_id: Option<u64>,  // 🔥 添加 fs_id 字段，用于下载去重记录
             all_completed: bool,
             old_status: String,
             new_status: String,
@@ -4557,7 +4571,7 @@ impl AutoBackupManager {
                         task.failed_count += 1;
                         tracing::debug!("文件任务 {} 已失败", file_task_id);
                     }
-                    
+
                     // 🔥 发送文件状态变更事件到 WebSocket
                     let file_name = file_task.local_path.file_name()
                         .and_then(|n| n.to_str())
@@ -4582,7 +4596,7 @@ impl AutoBackupManager {
                         old_status_str,
                         new_status_str,
                     );
-                    
+
                     file_task_info = Some((
                         file_task_id.clone(),
                         file_task.file_size,
@@ -4591,6 +4605,7 @@ impl AutoBackupManager {
                         file_task.encrypted,
                         file_task.encrypted_name.clone(),
                         file_task.head_md5.clone(),
+                        file_task.fs_id,  // 🔥 添加 fs_id，用于下载去重记录
                     ));
                 }
                 task.transfer_task_map.remove(transfer_task_id);
@@ -4629,7 +4644,7 @@ impl AutoBackupManager {
             }
 
             // 收集更新信息
-            if let Some((file_task_id, file_size, local_path, remote_path, encrypted, encrypted_name, head_md5)) = file_task_info {
+            if let Some((file_task_id, file_size, local_path, remote_path, encrypted, encrypted_name, head_md5, fs_id)) = file_task_info {
                 update_info = Some(TaskUpdateInfo {
                     backup_task_id: task.id.clone(),
                     config_id: task.config_id.clone(),
@@ -4640,6 +4655,7 @@ impl AutoBackupManager {
                     encrypted,
                     encrypted_name,
                     head_md5,
+                    fs_id,  // 🔥 添加 fs_id
                     all_completed,
                     old_status,
                     new_status,
@@ -4658,6 +4674,7 @@ impl AutoBackupManager {
                     encrypted: false,
                     encrypted_name: None,
                     head_md5: None,
+                    fs_id: None,  // 🔥 添加 fs_id
                     all_completed,
                     old_status,
                     new_status,
@@ -4717,8 +4734,12 @@ impl AutoBackupManager {
                             .unwrap_or("unknown")
                             .to_string();
 
-                        let fs_id = self.get_download_task_fs_id(transfer_task_id).await
-                            .unwrap_or_else(|| "unknown".to_string());
+                        // 🔥 修复：优先使用 BackupFileTask 中保存的 fs_id，避免从已清理的 DownloadManager 获取
+                        let fs_id = match update.fs_id {
+                            Some(id) => id.to_string(),
+                            None => self.get_download_task_fs_id(transfer_task_id).await
+                                .unwrap_or_else(|| "unknown".to_string()),
+                        };
 
                         let download_record = DownloadRecord {
                             config_id: cfg.id.clone(),
@@ -5248,21 +5269,21 @@ impl AutoBackupManager {
     }
 
     /// 安全获取 WebSocket 管理器
-    /// 
+    ///
     /// 从 Weak 引用升级为 Arc，如果原始对象已被销毁则返回 None
     pub fn get_ws_manager(&self) -> Option<Arc<WebSocketManager>> {
         self.ws_manager.read().as_ref().and_then(|weak| weak.upgrade())
     }
 
     /// 安全获取上传管理器引用
-    /// 
+    ///
     /// 从 Weak 引用升级为 Arc，如果原始对象已被销毁则返回 None
     pub fn get_upload_manager(&self) -> Option<Arc<UploadManager>> {
         self.upload_manager.read().as_ref().and_then(|weak| weak.upgrade())
     }
 
     /// 安全获取下载管理器引用
-    /// 
+    ///
     /// 从 Weak 引用升级为 Arc，如果原始对象已被销毁则返回 None
     pub fn get_download_manager(&self) -> Option<Arc<DownloadManager>> {
         self.download_manager.read().as_ref().and_then(|weak| weak.upgrade())
@@ -6000,7 +6021,7 @@ impl AutoBackupManager {
     // ==================== 优雅关闭 ====================
 
     /// 优雅关闭管理器
-    /// 
+    ///
     /// 执行以下步骤：
     /// 1. 停止接收新任务
     /// 2. 暂停所有正在执行的任务
@@ -6011,7 +6032,7 @@ impl AutoBackupManager {
     /// 7. 取消聚合器任务
     pub async fn shutdown(&self) -> ShutdownResult {
         tracing::info!("开始优雅关闭自动备份管理器...");
-        
+
         let mut result = ShutdownResult {
             success: true,
             saved_tasks: 0,
@@ -6256,8 +6277,8 @@ impl AutoBackupManager {
 
             // 计算远程路径
             let remote_path = format!("{}/{}",
-                config.remote_path.trim_end_matches('/'),
-                scanned_file.relative_path.to_string_lossy().replace('\\', "/"));
+                                      config.remote_path.trim_end_matches('/'),
+                                      scanned_file.relative_path.to_string_lossy().replace('\\', "/"));
 
             let file_task = BackupFileTask {
                 id: Uuid::new_v4().to_string(),
@@ -6556,7 +6577,7 @@ impl AutoBackupManager {
 
         // 🔥 优化：直接移动 file_tasks 到 task.pending_files，避免不必要的 clone
         let is_empty = file_tasks.is_empty();
-        
+
         // 更新任务
         if let Some(mut task) = self.tasks.get_mut(&task_id) {
             task.pending_files = file_tasks; // 直接移动，不再 clone
@@ -7002,10 +7023,10 @@ impl AutoBackupManager {
 
             // 计算远程路径
             let remote_path = format!("{}/{}",
-                config.remote_path.trim_end_matches('/'),
-                path.strip_prefix(&config.local_path)
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_else(|_| file_name.clone()));
+                                      config.remote_path.trim_end_matches('/'),
+                                      path.strip_prefix(&config.local_path)
+                                          .map(|p| p.to_string_lossy().replace('\\', "/"))
+                                          .unwrap_or_else(|_| file_name.clone()));
 
             let file_task = BackupFileTask {
                 id: Uuid::new_v4().to_string(),
@@ -7154,10 +7175,10 @@ impl AutoBackupManager {
 
             // 计算远程路径
             let remote_path = format!("{}/{}",
-                config.remote_path.trim_end_matches('/'),
-                path.strip_prefix(&config.local_path)
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_else(|_| file_name.clone()));
+                                      config.remote_path.trim_end_matches('/'),
+                                      path.strip_prefix(&config.local_path)
+                                          .map(|p| p.to_string_lossy().replace('\\', "/"))
+                                          .unwrap_or_else(|_| file_name.clone()));
 
             let file_task = BackupFileTask {
                 id: Uuid::new_v4().to_string(),

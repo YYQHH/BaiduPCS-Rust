@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -191,9 +191,29 @@ pub struct ChunkScheduler {
     waiting_queue_trigger: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
     /// 上一轮的任务数（用于检测任务数变化）
     last_task_count: Arc<AtomicUsize>,
+    /// 🔥 解密并发控制信号量（限制同时解密的文件数，避免内存和CPU过载）
+    decrypt_semaphore: Arc<Semaphore>,
 }
 
 impl ChunkScheduler {
+    /// 🔥 计算解密并发数（根据可用 CPU 核心数动态计算）
+    ///
+    /// 解密是 CPU 密集型 + 磁盘 IO 操作：
+    /// - 使用可用并行度的一半作为基准
+    /// - 最少 2 个（避免大文件阻塞小文件）
+    /// - 最多 8 个（避免内存和 CPU 过载）
+    ///
+    /// 注意：使用 std::thread::available_parallelism() 而不是 num_cpus
+    /// 因为它会考虑 Docker/cgroups 的 CPU 限制
+    fn calculate_decrypt_concurrency() -> usize {
+        let available_cpus = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4); // 获取失败时默认 4 核
+        let concurrency = (available_cpus / 2).max(2).min(8);
+        info!("解密并发数: {} (可用并行度: {})", concurrency, available_cpus);
+        concurrency
+    }
+
     /// 创建新的调度器
     pub fn new(max_global_threads: usize, max_concurrent_tasks: usize) -> Self {
         info!(
@@ -212,6 +232,10 @@ impl ChunkScheduler {
             backup_notification_tx: Arc::new(RwLock::new(None)),
             waiting_queue_trigger: Arc::new(RwLock::new(None)),
             last_task_count: Arc::new(AtomicUsize::new(0)),
+            // 🔥 解密并发限制：根据 CPU 核心数动态计算
+            // 解密是 CPU 密集型 + 磁盘 IO 操作
+            // 使用 CPU 核心数的一半（至少 2，最多 8）作为并发数
+            decrypt_semaphore: Arc::new(Semaphore::new(Self::calculate_decrypt_concurrency())),
         };
 
         // 启动全局调度循环
@@ -342,6 +366,7 @@ impl ChunkScheduler {
         let backup_notification_tx = self.backup_notification_tx.clone();
         let waiting_queue_trigger = self.waiting_queue_trigger.clone();
         let last_task_count = self.last_task_count.clone();
+        let decrypt_semaphore = self.decrypt_semaphore.clone();
 
         // 标记调度器正在运行
         scheduler_running.store(true, Ordering::SeqCst);
@@ -517,148 +542,35 @@ impl ChunkScheduler {
                                 task_info.cancellation_token.cancel();
                                 debug!("任务 {} 的 cancellation_token 已取消", task_id);
 
-                                // 🔥 检测是否为加密文件，如果是则执行解密
-                                let decrypt_result = Self::try_decrypt_if_encrypted(&task_info).await;
+                                // 🔥 异步并发解密：将解密任务 spawn 到独立线程，不阻塞调度循环
+                                let task_id_clone = task_id.to_string();
+                                let task_info_clone = task_info.clone();
+                                let task_completed_tx_clone = task_completed_tx.clone();
+                                let backup_notification_tx_clone = backup_notification_tx.clone();
+                                let waiting_queue_trigger_clone = waiting_queue_trigger.clone();
+                                let decrypt_semaphore_clone = decrypt_semaphore.clone();
 
-                                // 🔥 修复：根据解密结果决定任务状态
-                                // 如果解密失败，标记为 Failed 而不是 Completed
-                                let (group_id, is_backup, decrypt_error) = {
-                                    let mut t = task_info.task.lock().await;
+                                tokio::spawn(async move {
+                                    // 🔥 获取解密信号量，限制并发解密数量
+                                    let _permit = decrypt_semaphore_clone.acquire().await.unwrap();
+                                    debug!("任务 {} 获取解密信号量，开始解密流程", task_id_clone);
 
-                                    if let Err(ref e) = decrypt_result {
-                                        // 解密失败，标记为失败状态
-                                        let error_msg = format!("解密失败: {}", e);
-                                        t.mark_failed(error_msg.clone());
-                                        error!("任务 {} 解密失败: {}", task_id, e);
-                                        (t.group_id.clone(), t.is_backup, Some(error_msg))
-                                    } else {
-                                        // 解密成功或无需解密，标记为完成
-                                        t.mark_completed();
-                                        (t.group_id.clone(), t.is_backup, None)
-                                    }
-                                };
+                                    // 执行解密
+                                    let decrypt_result = Self::try_decrypt_if_encrypted(&task_info_clone).await;
 
-                                // 🔥 发布任务事件（根据解密结果发送 Completed 或 Failed）
-                                if !is_backup {
-                                    if let Some(ref ws_manager) = task_info.ws_manager {
-                                        if let Some(ref error_msg) = decrypt_error {
-                                            // 解密失败，发送 Failed 事件
-                                            ws_manager.send_if_subscribed(
-                                                TaskEvent::Download(DownloadEvent::Failed {
-                                                    task_id: task_id.to_string(),
-                                                    error: error_msg.clone(),
-                                                    group_id: group_id.clone(),
-                                                    is_backup,
-                                                }),
-                                                group_id.clone(),
-                                            );
-                                        } else {
-                                            // 解密成功或无需解密，发送 Completed 事件
-                                            ws_manager.send_if_subscribed(
-                                                TaskEvent::Download(DownloadEvent::Completed {
-                                                    task_id: task_id.to_string(),
-                                                    completed_at: chrono::Utc::now().timestamp_millis(),
-                                                    group_id: group_id.clone(),
-                                                    is_backup,
-                                                }),
-                                                group_id.clone(),
-                                            );
-                                        }
-                                    }
-                                }
+                                    // 处理解密结果
+                                    Self::handle_task_completion(
+                                        &task_id_clone,
+                                        &task_info_clone,
+                                        decrypt_result,
+                                        &task_completed_tx_clone,
+                                        &backup_notification_tx_clone,
+                                        &waiting_queue_trigger_clone,
+                                    ).await;
 
-                                // 🔥 根据解密结果区分成功和失败的清理逻辑（与上传任务行为保持一致）
-                                if decrypt_error.is_none() {
-                                    // 成功时（解密成功或无需解密）：归档到历史数据库，从 manager_tasks 移除
-                                    if let Some(ref pm) = task_info.persistence_manager {
-                                        if let Err(e) = pm.lock().await.on_task_completed(task_id) {
-                                            error!("归档下载任务到历史数据库失败: {}", e);
-                                        } else {
-                                            debug!("下载任务 {} 已归档到历史数据库", task_id);
-                                        }
-                                    }
-
-                                    // 🔥 从 DownloadManager.tasks 中移除任务（成功时立即清理，避免内存泄漏）
-                                    if let Some(ref manager_tasks) = task_info.manager_tasks {
-                                        manager_tasks.write().await.remove(task_id);
-                                        debug!("下载任务 {} 已从 DownloadManager.tasks 中移除", task_id);
-                                    }
-                                } else {
-                                    // 失败时（解密失败）：更新 WAL 元数据，不从 manager_tasks 移除（让前端能看到）
-                                    if let Some(ref pm) = task_info.persistence_manager {
-                                        if let Err(e) = pm.lock().await.update_task_error(
-                                            task_id,
-                                            decrypt_error.clone().unwrap_or_default()
-                                        ) {
-                                            warn!("更新下载任务错误信息失败: {}", e);
-                                        } else {
-                                            debug!("下载任务 {} 错误信息已更新到 WAL", task_id);
-                                        }
-                                    }
-                                    // 🔥 失败时不从 manager_tasks 移除，让前端能看到失败任务
-                                    debug!("下载任务 {} 失败，保留在 manager_tasks 中供前端查看", task_id);
-                                }
-
-                                // 🔥 释放任务槽位（单文件任务释放固定位，借调位由 FolderManager 管理）
-                                if let Some(slot_id) = task_info.slot_id {
-                                    if !task_info.is_borrowed_slot {
-                                        // 单文件任务：释放固定位
-                                        if let Some(ref slot_pool) = task_info.task_slot_pool {
-                                            slot_pool.release_fixed_slot(task_id).await;
-                                            info!("任务 {} 完成，释放固定槽位 {}", task_id, slot_id);
-                                        }
-                                    }
-                                    // 借调位由 FolderManager 管理，这里不释放
-                                }
-
-                                // 如果是文件夹子任务，通知补充新任务
-                                if let Some(gid) = group_id {
-                                    let tx_guard = task_completed_tx.read().await;
-                                    if let Some(tx) = tx_guard.as_ref() {
-                                        if let Err(e) = tx.send(gid.clone()) {
-                                            error!("发送任务完成通知失败: {}", e);
-                                        } else {
-                                            debug!("已发送任务完成通知: group_id={}", gid);
-                                        }
-                                    }
-                                }
-
-                                // 🔥 如果是备份任务，通知 AutoBackupManager（根据解密结果发送 Completed 或 Failed）
-                                if is_backup {
-                                    let tx_guard = backup_notification_tx.read().await;
-                                    if let Some(tx) = tx_guard.as_ref() {
-                                        let notification = if let Some(ref error_msg) = decrypt_error {
-                                            // 解密失败，发送 Failed 通知
-                                            BackupTransferNotification::Failed {
-                                                task_id: task_id.to_string(),
-                                                task_type: TransferTaskType::Download,
-                                                error_message: error_msg.clone(),
-                                            }
-                                        } else {
-                                            // 解密成功或无需解密，发送 Completed 通知
-                                            BackupTransferNotification::Completed {
-                                                task_id: task_id.to_string(),
-                                                task_type: TransferTaskType::Download,
-                                            }
-                                        };
-                                        if let Err(e) = tx.send(notification) {
-                                            error!("发送备份下载任务通知失败: {}", e);
-                                        } else {
-                                            debug!("已发送备份下载任务通知: task_id={}, 状态={}",
-                                                task_id,
-                                                if decrypt_error.is_some() { "失败" } else { "完成" });
-                                        }
-                                    }
-                                }
-
-                                // 🔥 触发等待队列检查（0延迟启动新任务）
-                                {
-                                    let trigger_guard = waiting_queue_trigger.read().await;
-                                    if let Some(trigger) = trigger_guard.as_ref() {
-                                        let _ = trigger.send(()); // 忽略发送失败（receiver 可能已关闭）
-                                        debug!("已触发等待队列检查");
-                                    }
-                                }
+                                    debug!("任务 {} 解密流程完成，释放解密信号量", task_id_clone);
+                                    // _permit 在这里自动释放
+                                });
                             }
 
                             consecutive_empty_rounds += 1;
@@ -835,6 +747,132 @@ impl ChunkScheduler {
     pub fn stop(&self) {
         self.scheduler_running.store(false, Ordering::SeqCst);
         info!("调度器停止信号已发送");
+    }
+
+    /// 🔥 处理任务完成（解密后的后续处理）
+    ///
+    /// 包括：更新任务状态、发送事件、归档、释放槽位、通知等
+    async fn handle_task_completion(
+        task_id: &str,
+        task_info: &TaskScheduleInfo,
+        decrypt_result: Result<()>,
+        task_completed_tx: &Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+        backup_notification_tx: &Arc<RwLock<Option<mpsc::UnboundedSender<BackupTransferNotification>>>>,
+        waiting_queue_trigger: &Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
+    ) {
+        // 根据解密结果决定任务状态
+        let (group_id, is_backup, decrypt_error) = {
+            let mut t = task_info.task.lock().await;
+
+            if let Err(ref e) = decrypt_result {
+                let error_msg = format!("解密失败: {}", e);
+                t.mark_failed(error_msg.clone());
+                error!("任务 {} 解密失败: {}", task_id, e);
+                (t.group_id.clone(), t.is_backup, Some(error_msg))
+            } else {
+                t.mark_completed();
+                (t.group_id.clone(), t.is_backup, None)
+            }
+        };
+
+        // 发布任务事件
+        if !is_backup {
+            if let Some(ref ws_manager) = task_info.ws_manager {
+                if let Some(ref error_msg) = decrypt_error {
+                    ws_manager.send_if_subscribed(
+                        TaskEvent::Download(DownloadEvent::Failed {
+                            task_id: task_id.to_string(),
+                            error: error_msg.clone(),
+                            group_id: group_id.clone(),
+                            is_backup,
+                        }),
+                        group_id.clone(),
+                    );
+                } else {
+                    ws_manager.send_if_subscribed(
+                        TaskEvent::Download(DownloadEvent::Completed {
+                            task_id: task_id.to_string(),
+                            completed_at: chrono::Utc::now().timestamp_millis(),
+                            group_id: group_id.clone(),
+                            is_backup,
+                        }),
+                        group_id.clone(),
+                    );
+                }
+            }
+        }
+
+        // 处理持久化和清理
+        if decrypt_error.is_none() {
+            if let Some(ref pm) = task_info.persistence_manager {
+                if let Err(e) = pm.lock().await.on_task_completed(task_id) {
+                    error!("归档下载任务到历史数据库失败: {}", e);
+                } else {
+                    debug!("下载任务 {} 已归档到历史数据库", task_id);
+                }
+            }
+            if let Some(ref manager_tasks) = task_info.manager_tasks {
+                manager_tasks.write().await.remove(task_id);
+                debug!("下载任务 {} 已从 DownloadManager.tasks 中移除", task_id);
+            }
+        } else {
+            if let Some(ref pm) = task_info.persistence_manager {
+                if let Err(e) = pm.lock().await.update_task_error(
+                    task_id,
+                    decrypt_error.clone().unwrap_or_default()
+                ) {
+                    warn!("更新下载任务错误信息失败: {}", e);
+                }
+            }
+        }
+
+        // 释放任务槽位
+        if let Some(slot_id) = task_info.slot_id {
+            if !task_info.is_borrowed_slot {
+                if let Some(ref slot_pool) = task_info.task_slot_pool {
+                    slot_pool.release_fixed_slot(task_id).await;
+                    info!("任务 {} 完成，释放固定槽位 {}", task_id, slot_id);
+                }
+            }
+        }
+
+        // 通知文件夹任务补充
+        if let Some(gid) = group_id.clone() {
+            let tx_guard = task_completed_tx.read().await;
+            if let Some(tx) = tx_guard.as_ref() {
+                if let Err(e) = tx.send(gid.clone()) {
+                    error!("发送任务完成通知失败: {}", e);
+                }
+            }
+        }
+
+        // 通知备份管理器
+        if is_backup {
+            let tx_guard = backup_notification_tx.read().await;
+            if let Some(tx) = tx_guard.as_ref() {
+                let notification = if let Some(ref error_msg) = decrypt_error {
+                    BackupTransferNotification::Failed {
+                        task_id: task_id.to_string(),
+                        task_type: TransferTaskType::Download,
+                        error_message: error_msg.clone(),
+                    }
+                } else {
+                    BackupTransferNotification::Completed {
+                        task_id: task_id.to_string(),
+                        task_type: TransferTaskType::Download,
+                    }
+                };
+                let _ = tx.send(notification);
+            }
+        }
+
+        // 触发等待队列检查
+        {
+            let trigger_guard = waiting_queue_trigger.read().await;
+            if let Some(trigger) = trigger_guard.as_ref() {
+                let _ = trigger.send(());
+            }
+        }
     }
 
     /// 🔥 检测并解密加密文件

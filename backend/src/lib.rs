@@ -46,6 +46,9 @@ pub mod encryption;
 // 🔥 任务槽池模块（下载和上传共用）
 pub mod task_slot_pool;
 
+// 🔥 Web 访问认证模块
+pub mod web_auth;
+
 // 导出常用类型
 pub use auth::{LoginRequest, LoginResponse, QRCode, QRCodeStatus, UserAuth};
 pub use config::AppConfig;

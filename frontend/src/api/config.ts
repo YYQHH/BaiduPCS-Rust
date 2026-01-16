@@ -1,10 +1,25 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
 
+// 本地存储键名（与 webAuth store 保持一致）
+const WEB_AUTH_ACCESS_TOKEN_KEY = 'web_auth_access_token'
+
 const apiClient = axios.create({
   baseURL: '/api/v1',
   timeout: 10000,
 })
+
+// 添加 Web 认证拦截器
+apiClient.interceptors.request.use(
+    (config) => {
+      const token = localStorage.getItem(WEB_AUTH_ACCESS_TOKEN_KEY)
+      if (token) {
+        config.headers.Authorization = `Bearer ${token}`
+      }
+      return config
+    },
+    (error) => Promise.reject(error)
+)
 
 // 响应拦截器
 apiClient.interceptors.response.use(

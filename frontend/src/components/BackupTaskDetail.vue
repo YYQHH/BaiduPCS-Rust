@@ -208,11 +208,15 @@ function handleBackupEvent(event: BackupEvent) {
       break
     }
     case 'file_status_changed': {
-      // 更新文件任务状态（仅状态，不更新进度）
+      // 更新文件任务状态
       const fileStatusEvent = event as BackupEvent & { event_type: 'file_status_changed' }
       const fileTask = fileTasks.value.find(f => f.id === fileStatusEvent.file_task_id)
       if (fileTask) {
         fileTask.status = fileStatusEvent.new_status as BackupFileStatus
+        // 🔥 修复：当状态变为 completed 时，确保进度显示为 100%
+        if (fileStatusEvent.new_status === 'completed') {
+          fileTask.transferred_bytes = fileTask.file_size
+        }
         console.log(`[BackupTaskDetail] 文件状态变更: ${fileStatusEvent.file_name} -> ${fileStatusEvent.old_status} -> ${fileStatusEvent.new_status}`)
       }
       break
@@ -392,10 +396,10 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
 
 <template>
   <el-dialog
-    v-model="visible"
-    title="备份任务详情"
-    width="600px"
-    :close-on-click-modal="false"
+      v-model="visible"
+      title="备份任务详情"
+      width="600px"
+      :close-on-click-modal="false"
   >
     <div v-if="tasks.length === 0" class="empty-tasks">
       <el-empty description="暂无备份任务记录" :image-size="80" />
@@ -406,15 +410,15 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
       <div v-if="tasks.length > 1" class="task-selector">
         <span class="selector-label">选择任务：</span>
         <el-select
-          v-model="selectedTaskIndex"
-          size="small"
-          style="width: 280px"
+            v-model="selectedTaskIndex"
+            size="small"
+            style="width: 280px"
         >
           <el-option
-            v-for="(option, index) in taskOptions"
-            :key="option.task.id"
-            :value="index"
-            :label="option.label"
+              v-for="(option, index) in taskOptions"
+              :key="option.task.id"
+              :value="index"
+              :label="option.label"
           >
             <div class="task-option">
               <el-icon :size="14" :style="{ color: getStatusColor(option.task.status) }">
@@ -432,9 +436,9 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
       <div class="status-header">
         <div class="status-icon" :style="{ backgroundColor: getStatusColor(task.status) + '20' }">
           <component
-            :is="getStatusIcon(task.status)"
-            :style="{ color: getStatusColor(task.status) }"
-            :class="{ 'is-loading': ['queued', 'preparing', 'transferring'].includes(task.status) }"
+              :is="getStatusIcon(task.status)"
+              :style="{ color: getStatusColor(task.status) }"
+              :class="{ 'is-loading': ['queued', 'preparing', 'transferring'].includes(task.status) }"
           />
         </div>
         <div class="status-info">
@@ -521,9 +525,9 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
 
             <div v-else class="file-task-list">
               <div
-                v-for="fileTask in fileTasks"
-                :key="fileTask.id"
-                class="file-task-item"
+                  v-for="fileTask in fileTasks"
+                  :key="fileTask.id"
+                  class="file-task-item"
               >
                 <!-- 文件信息 -->
                 <div class="file-info">
@@ -549,10 +553,10 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
                 <div class="file-status-actions">
                   <!-- 状态标签 -->
                   <el-tag
-                    :type="fileTask.status === 'completed' ? 'success' :
+                      :type="fileTask.status === 'completed' ? 'success' :
                            fileTask.status === 'failed' ? 'danger' :
                            fileTask.status === 'skipped' ? 'warning' : 'info'"
-                    size="small"
+                      size="small"
                   >
                     <el-icon class="status-icon-small">
                       <component :is="getFileStatusIcon(fileTask.status)" />
@@ -562,9 +566,9 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
 
                   <!-- 跳过原因 -->
                   <el-tooltip
-                    v-if="fileTask.status === 'skipped' && fileTask.skip_reason"
-                    :content="getSkipReasonText(fileTask.skip_reason)"
-                    placement="top"
+                      v-if="fileTask.status === 'skipped' && fileTask.skip_reason"
+                      :content="getSkipReasonText(fileTask.skip_reason)"
+                      placement="top"
                   >
                     <div class="skip-reason">
                       <el-icon :color="'#E6A23C'">
@@ -576,9 +580,9 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
 
                   <!-- 错误信息 -->
                   <el-tooltip
-                    v-if="fileTask.status === 'failed' && fileTask.error_message"
-                    :content="fileTask.error_message"
-                    placement="top"
+                      v-if="fileTask.status === 'failed' && fileTask.error_message"
+                      :content="fileTask.error_message"
+                      placement="top"
                   >
                     <div class="error-info">
                       <el-icon color="#F56C6C"><Warning /></el-icon>
@@ -588,11 +592,11 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
 
                   <!-- 重试按钮 -->
                   <el-button
-                    v-if="canRetryFile(fileTask)"
-                    type="primary"
-                    size="small"
-                    :loading="retryingFileId === fileTask.id"
-                    @click="handleRetryFile(fileTask)"
+                      v-if="canRetryFile(fileTask)"
+                      type="primary"
+                      size="small"
+                      :loading="retryingFileId === fileTask.id"
+                      @click="handleRetryFile(fileTask)"
                   >
                     <el-icon class="mr-1"><Refresh /></el-icon>
                     重试
@@ -604,11 +608,11 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
             <!-- 分页 -->
             <div v-if="fileTasksTotal > fileTasksPageSize" class="pagination-wrapper">
               <el-pagination
-                v-model:current-page="fileTasksPage"
-                :page-size="fileTasksPageSize"
-                :total="fileTasksTotal"
-                layout="prev, pager, next"
-                @current-change="handlePageChange"
+                  v-model:current-page="fileTasksPage"
+                  :page-size="fileTasksPageSize"
+                  :total="fileTasksTotal"
+                  layout="prev, pager, next"
+                  @current-change="handlePageChange"
               />
             </div>
           </div>
@@ -620,17 +624,17 @@ function canRetryFile(fileTask: BackupFileTask): boolean {
       <div class="dialog-footer">
         <el-button @click="visible = false">关闭</el-button>
         <el-button
-          v-if="canPause"
-          type="warning"
-          @click="handlePause"
+            v-if="canPause"
+            type="warning"
+            @click="handlePause"
         >
           <el-icon class="mr-1"><VideoPause /></el-icon>
           暂停
         </el-button>
         <el-button
-          v-if="canResume"
-          type="success"
-          @click="handleResume"
+            v-if="canResume"
+            type="success"
+            @click="handleResume"
         >
           <el-icon class="mr-1"><VideoPlay /></el-icon>
           恢复

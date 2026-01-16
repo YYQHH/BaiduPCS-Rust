@@ -1,5 +1,167 @@
-import axios, { type AxiosInstance, type AxiosResponse } from 'axios'
+import axios, { type AxiosInstance, type AxiosResponse, type AxiosError, type InternalAxiosRequestConfig } from 'axios'
 import { ElMessage } from 'element-plus'
+
+// ============ Web 认证令牌管理 ============
+
+// 本地存储键名（与 webAuth store 保持一致）
+const WEB_AUTH_ACCESS_TOKEN_KEY = 'web_auth_access_token'
+const WEB_AUTH_REFRESH_TOKEN_KEY = 'web_auth_refresh_token'
+
+// Web 认证专用 HTTP 状态码（与后端保持一致）
+// 419 表示 Web 认证令牌过期，区别于 401 百度账号认证失败
+const WEB_AUTH_EXPIRED_STATUS = 419
+
+// 令牌刷新状态
+let isRefreshing = false
+let refreshSubscribers: Array<(token: string) => void> = []
+
+/**
+ * 获取 Web 认证访问令牌
+ */
+function getWebAuthAccessToken(): string | null {
+    return localStorage.getItem(WEB_AUTH_ACCESS_TOKEN_KEY)
+}
+
+/**
+ * 获取 Web 认证刷新令牌
+ */
+function getWebAuthRefreshToken(): string | null {
+    return localStorage.getItem(WEB_AUTH_REFRESH_TOKEN_KEY)
+}
+
+/**
+ * 保存令牌到本地存储
+ */
+function saveTokens(accessToken: string, refreshToken: string, accessExpiresAt: number, refreshExpiresAt: number): void {
+    localStorage.setItem(WEB_AUTH_ACCESS_TOKEN_KEY, accessToken)
+    localStorage.setItem(WEB_AUTH_REFRESH_TOKEN_KEY, refreshToken)
+    localStorage.setItem('web_auth_access_expires_at', accessExpiresAt.toString())
+    localStorage.setItem('web_auth_refresh_expires_at', refreshExpiresAt.toString())
+}
+
+/**
+ * 清除所有 Web 认证令牌
+ */
+function clearWebAuthTokens(): void {
+    localStorage.removeItem(WEB_AUTH_ACCESS_TOKEN_KEY)
+    localStorage.removeItem(WEB_AUTH_REFRESH_TOKEN_KEY)
+    localStorage.removeItem('web_auth_access_expires_at')
+    localStorage.removeItem('web_auth_refresh_expires_at')
+}
+
+/**
+ * 跳转到 Web 登录页
+ */
+function redirectToWebLogin(): void {
+    if (window.location.pathname !== '/web-login') {
+        clearWebAuthTokens()
+        window.location.href = '/web-login'
+    }
+}
+
+/**
+ * 刷新令牌
+ */
+async function refreshTokens(): Promise<string | null> {
+    const refreshToken = getWebAuthRefreshToken()
+    if (!refreshToken) {
+        return null
+    }
+
+    try {
+        const response = await axios.post('/api/v1/web-auth/refresh', {
+            refresh_token: refreshToken
+        })
+
+        const { access_token, refresh_token, access_expires_at, refresh_expires_at } = response.data
+        saveTokens(access_token, refresh_token, access_expires_at, refresh_expires_at)
+        return access_token
+    } catch (error) {
+        console.error('令牌刷新失败:', error)
+        return null
+    }
+}
+
+/**
+ * 通知所有等待刷新的请求
+ */
+function onRefreshed(token: string): void {
+    refreshSubscribers.forEach(callback => callback(token))
+    refreshSubscribers = []
+}
+
+/**
+ * 添加等待刷新的请求
+ */
+function addRefreshSubscriber(callback: (token: string) => void): void {
+    refreshSubscribers.push(callback)
+}
+
+/**
+ * 为 axios 实例添加 Web 认证拦截器
+ * 自动在请求头中添加 Authorization header
+ * 处理 419 Web 认证失败，尝试刷新令牌后重试请求
+ */
+function addWebAuthInterceptor(client: AxiosInstance): void {
+    // 请求拦截器：添加 Authorization header
+    client.interceptors.request.use(
+        (config) => {
+            const token = getWebAuthAccessToken()
+            if (token) {
+                config.headers.Authorization = `Bearer ${token}`
+            }
+            return config
+        },
+        (error) => Promise.reject(error)
+    )
+
+    // 响应拦截器：处理 419 Web 认证失败
+    client.interceptors.response.use(
+        (response) => response,
+        async (error: AxiosError) => {
+            const originalRequest = error.config as InternalAxiosRequestConfig & { _retry?: boolean }
+
+            // 如果是 419 错误且未重试过
+            if (error.response?.status === WEB_AUTH_EXPIRED_STATUS && originalRequest && !originalRequest._retry) {
+                // 如果正在刷新，等待刷新完成后重试
+                if (isRefreshing) {
+                    return new Promise((resolve) => {
+                        addRefreshSubscriber((token: string) => {
+                            originalRequest.headers.Authorization = `Bearer ${token}`
+                            resolve(client(originalRequest))
+                        })
+                    })
+                }
+
+                originalRequest._retry = true
+                isRefreshing = true
+
+                try {
+                    const newToken = await refreshTokens()
+
+                    if (newToken) {
+                        // 刷新成功，通知等待的请求并重试原始请求
+                        onRefreshed(newToken)
+                        originalRequest.headers.Authorization = `Bearer ${newToken}`
+                        return client(originalRequest)
+                    } else {
+                        // 刷新失败（没有 refresh token 或刷新接口返回错误）
+                        redirectToWebLogin()
+                        return Promise.reject(error)
+                    }
+                } catch (refreshError) {
+                    // 刷新过程出错
+                    redirectToWebLogin()
+                    return Promise.reject(refreshError)
+                } finally {
+                    isRefreshing = false
+                }
+            }
+
+            return Promise.reject(error)
+        }
+    )
+}
 
 /**
  * 创建统一的 API 客户端
@@ -13,6 +175,9 @@ export function createApiClient(options: { timeout?: number; showErrorMessage?: 
         timeout,
     })
 
+    // 添加 Web 认证拦截器（包含 401 处理）
+    addWebAuthInterceptor(client)
+
     // 响应拦截器
     client.interceptors.response.use(
         (response: AxiosResponse) => {
@@ -25,11 +190,26 @@ export function createApiClient(options: { timeout?: number; showErrorMessage?: 
             }
             return response.data.data
         },
-        (error) => {
-            if (showErrorMessage) {
-                ElMessage.error(error.response?.data?.message || error.message || '网络错误')
+        (error: AxiosError) => {
+            // 419 已在 addWebAuthInterceptor 中处理跳转
+            if (error.response?.status === WEB_AUTH_EXPIRED_STATUS) {
+                // 显示提示信息
+                if (showErrorMessage) {
+                    ElMessage.error('Web 认证令牌已过期，请重新登录')
+                }
+                return Promise.reject(new Error('Web 认证令牌已过期'))
             }
-            return Promise.reject(error)
+
+            // 优先使用后端返回的 message，避免显示原始 HTTP 错误信息
+            const errorData = error.response?.data as { message?: string; error?: string } | undefined
+            const errorMessage = errorData?.message
+                || errorData?.error
+                || (error.response?.status ? `请求失败 (${error.response.status})` : '网络错误')
+
+            if (showErrorMessage) {
+                ElMessage.error(errorMessage)
+            }
+            return Promise.reject(new Error(errorMessage))
         }
     )
 
@@ -47,6 +227,9 @@ export function createApiClientWithErrorCode(options: { timeout?: number } = {})
         timeout,
     })
 
+    // 添加 Web 认证拦截器（包含 401 处理）
+    addWebAuthInterceptor(client)
+
     // 响应拦截器 - 返回完整错误信息让调用方处理
     client.interceptors.response.use(
         (response: AxiosResponse) => {
@@ -56,9 +239,21 @@ export function createApiClientWithErrorCode(options: { timeout?: number } = {})
             }
             return response.data.data
         },
-        (error) => {
-            ElMessage.error(error.response?.data?.message || error.message || '网络错误')
-            return Promise.reject(error)
+        (error: AxiosError) => {
+            // 419 已在 addWebAuthInterceptor 中处理跳转
+            if (error.response?.status === WEB_AUTH_EXPIRED_STATUS) {
+                ElMessage.error('Web 认证令牌已过期，请重新登录')
+                return Promise.reject(new Error('Web 认证令牌已过期'))
+            }
+
+            // 优先使用后端返回的 message，避免显示原始 HTTP 错误信息
+            const errorData = error.response?.data as { message?: string; error?: string } | undefined
+            const errorMessage = errorData?.message
+                || errorData?.error
+                || (error.response?.status ? `请求失败 (${error.response.status})` : '网络错误')
+
+            ElMessage.error(errorMessage)
+            return Promise.reject(new Error(errorMessage))
         }
     )
 
@@ -83,14 +278,23 @@ export function createRawApiClient(options: { timeout?: number } = {}): AxiosIns
         timeout,
     })
 
+    // 添加 Web 认证拦截器（包含 401 处理）
+    addWebAuthInterceptor(client)
+
     // 只处理网络错误，不处理业务响应格式
     // 从 response.data 中提取错误信息，让调用方决定如何处理
     client.interceptors.response.use(
         (response: AxiosResponse) => response,
-        (error) => {
+        (error: AxiosError) => {
+            // 419 已在 addWebAuthInterceptor 中处理跳转
+            if (error.response?.status === WEB_AUTH_EXPIRED_STATUS) {
+                return Promise.reject(new Error('Web 认证令牌已过期'))
+            }
+
             // 从 response.data 中提取错误信息（支持 message 或 error 字段）
-            const errorMessage = error.response?.data?.message
-                || error.response?.data?.error
+            const errorData = error.response?.data as { message?: string; error?: string } | undefined
+            const errorMessage = errorData?.message
+                || errorData?.error
                 || error.message
                 || '网络错误'
 

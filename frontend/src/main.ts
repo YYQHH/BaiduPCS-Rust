@@ -21,5 +21,10 @@ app.use(pinia)
 app.use(router)
 app.use(ElementPlus)
 
+// 初始化 Web 认证 Store（在 pinia 安装后）
+import { useWebAuthStore } from './stores/webAuth'
+const webAuthStore = useWebAuthStore()
+webAuthStore.initialize()
+
 app.mount('#app')
 

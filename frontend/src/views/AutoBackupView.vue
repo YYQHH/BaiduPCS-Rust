@@ -620,8 +620,12 @@ function updateFileTaskStatus(event: BackupEvent & { event_type: 'file_status_ch
   for (const [_configId, fileTasks] of activeFileTasks.value) {
     const fileTask = fileTasks.find(f => f.id === event.file_task_id)
     if (fileTask) {
-      // 仅更新状态
+      // 更新状态
       fileTask.status = event.new_status as BackupFileTask['status']
+      // 🔥 修复：当状态变为 completed 时，确保进度显示为 100%
+      if (event.new_status === 'completed') {
+        fileTask.transferred_bytes = fileTask.file_size
+      }
       // 触发响应式更新
       activeFileTasks.value = new Map(activeFileTasks.value)
       console.log(`[AutoBackup] 文件状态变更: ${event.file_name} -> ${event.old_status} -> ${event.new_status}`)
