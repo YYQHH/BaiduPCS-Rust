@@ -82,6 +82,10 @@ pub struct DownloadTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_config_id: Option<String>,
 
+    /// 🔥 启动重试次数（用于限制准备/注册失败的重试）
+    #[serde(skip)]
+    pub start_retry_count: u32,
+
     // === 🔥 解密相关字段 ===
     /// 是否为加密文件（通过文件名或内容检测）
     #[serde(default)]
@@ -127,6 +131,7 @@ impl DownloadTask {
             // 自动备份字段初始化
             is_backup: false,
             backup_config_id: None,
+            start_retry_count: 0,
             // 解密字段初始化
             is_encrypted: false,
             decrypt_progress: 0.0,

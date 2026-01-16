@@ -74,6 +74,9 @@
               </el-form-item>
             </el-card>
 
+            <!-- Web 访问认证设置 -->
+            <AuthSettingsSection />
+
             <!-- 下载配置 -->
             <el-card class="setting-card" shadow="hover">
               <template #header>
@@ -680,6 +683,7 @@ import { useConfigStore } from '@/stores/config'
 import type { AppConfig } from '@/api/config'
 import { getRecommendedConfig, resetToRecommended } from '@/api/config'
 import { FilePickerModal } from '@/components/FilePicker'
+import AuthSettingsSection from '@/components/settings/AuthSettingsSection.vue'
 import {
   Check,
   RefreshLeft,

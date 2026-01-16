@@ -121,10 +121,16 @@
             </el-avatar>
             <span class="drawer-username">{{ username }}</span>
           </div>
-          <el-button type="danger" plain size="small" @click="handleLogout">
-            <el-icon><SwitchButton /></el-icon>
-            退出
-          </el-button>
+          <div class="drawer-logout-buttons">
+            <el-button type="danger" plain size="small" @click="handleDrawerLogout">
+              <el-icon><SwitchButton /></el-icon>
+              退出百度
+            </el-button>
+            <el-button v-if="webAuthStore.isAuthEnabled" type="warning" plain size="small" @click="handleDrawerWebLogout">
+              <el-icon><Lock /></el-icon>
+              退出Web
+            </el-button>
+          </div>
         </div>
       </div>
     </el-drawer>
@@ -162,7 +168,11 @@
                 </el-dropdown-item>
                 <el-dropdown-item command="logout" divided>
                   <el-icon><SwitchButton /></el-icon>
-                  退出登录
+                  退出百度账号
+                </el-dropdown-item>
+                <el-dropdown-item v-if="webAuthStore.isAuthEnabled" command="webLogout">
+                  <el-icon><Lock /></el-icon>
+                  退出 Web 认证
                 </el-dropdown-item>
               </el-dropdown-menu>
             </template>
@@ -206,6 +216,7 @@ import { ref, computed, watch, markRaw } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
+import { useWebAuthStore } from '@/stores/webAuth'
 import { useIsMobile } from '@/utils/responsive'
 import UserProfileDialog from '@/components/UserProfileDialog.vue'
 import {
@@ -222,11 +233,13 @@ import {
   Share,
   Menu,
   Refresh,
+  Lock,
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
+const webAuthStore = useWebAuthStore()
 
 // 响应式检测
 const isMobile = useIsMobile()
@@ -282,6 +295,18 @@ function handleUserClick() {
   profileDialogVisible.value = true
 }
 
+// 抽屉退出百度账号
+async function handleDrawerLogout() {
+  drawerVisible.value = false
+  await handleLogout()
+}
+
+// 抽屉退出 Web 认证
+async function handleDrawerWebLogout() {
+  drawerVisible.value = false
+  await handleWebLogout()
+}
+
 // 抽屉退出登录
 async function handleLogout() {
   try {
@@ -310,6 +335,27 @@ async function handleCommand(command: string) {
     case 'logout':
       await handleLogout()
       break
+    case 'webLogout':
+      await handleWebLogout()
+      break
+  }
+}
+
+// Web 认证登出
+async function handleWebLogout() {
+  try {
+    await ElMessageBox.confirm('确定要退出 Web 认证吗？退出后需要重新登录才能访问。', '退出确认', {
+      confirmButtonText: '确定',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+    await webAuthStore.logout()
+    ElMessage.success('已退出 Web 认证')
+    router.push('/web-login')
+  } catch (error) {
+    if (error !== 'cancel') {
+      console.error('退出 Web 认证失败:', error)
+    }
   }
 }
 
@@ -522,6 +568,12 @@ watch(
         color: white;
         font-size: 14px;
       }
+    }
+
+    .drawer-logout-buttons {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
     }
   }
 }

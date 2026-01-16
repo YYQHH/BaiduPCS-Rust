@@ -1670,6 +1670,7 @@ impl DownloadManager {
                                 let snapshot_manager_arc_clone = snapshot_manager_arc.clone(); // 🔥 用于查询加密文件映射
                                 let encryption_config_store_arc_clone = encryption_config_store_arc.clone(); // 🔥 用于根据 key_version 选择解密密钥
                                 let tasks_clone = tasks.clone(); // 🔥 用于任务完成时立即清理
+                                let waiting_queue_clone = waiting_queue.clone(); // 🔥 用于备份任务失败重试
 
                                 tokio::spawn(async move {
                                     // 获取 WebSocket 管理器和文件夹进度发送器
@@ -1949,8 +1950,44 @@ impl DownloadManager {
                                                 }
                                                 Err(e) => {
                                                     error!("0延迟启动：注册任务失败: {}", e);
-                                                    let mut t = task_clone.lock().await;
-                                                    t.mark_failed(e.to_string());
+                                                    // 🔥 释放已分配的槽位
+                                                    let (slot_id, is_backup, is_folder_subtask, retry_count) = {
+                                                        let t = task_clone.lock().await;
+                                                        (t.slot_id, t.is_backup, t.group_id.is_some(), t.start_retry_count)
+                                                    };
+                                                    if let Some(sid) = slot_id {
+                                                        task_slot_pool_clone.release_fixed_slot(&id_clone).await;
+                                                        info!("0延迟启动：注册失败，释放槽位 {} (任务: {})", sid, id_clone);
+                                                    }
+
+                                                    // 🔥 最大重试次数限制
+                                                    const MAX_START_RETRIES: u32 = 3;
+
+                                                    // 🔥 备份任务或文件夹子任务：检查重试次数后决定是否重试
+                                                    if (is_backup || is_folder_subtask) && retry_count < MAX_START_RETRIES {
+                                                        warn!(
+                                                            "0延迟启动：任务 {} 注册失败（{}），放回等待队列等待重试 (重试 {}/{})",
+                                                            id_clone, e, retry_count + 1, MAX_START_RETRIES
+                                                        );
+                                                        {
+                                                            let mut t = task_clone.lock().await;
+                                                            t.status = TaskStatus::Pending;
+                                                            t.slot_id = None;
+                                                            t.error = Some(e.to_string());
+                                                            t.start_retry_count += 1;
+                                                        }
+                                                        waiting_queue_clone.write().await.push_back(id_clone.clone());
+                                                    } else {
+                                                        if retry_count >= MAX_START_RETRIES {
+                                                            error!(
+                                                                "0延迟启动：任务 {} 重试次数已达上限 ({})，标记为失败",
+                                                                id_clone, MAX_START_RETRIES
+                                                            );
+                                                        }
+                                                        let mut t = task_clone.lock().await;
+                                                        t.mark_failed(e.to_string());
+                                                        t.slot_id = None;
+                                                    }
                                                     cancellation_tokens_clone
                                                         .write()
                                                         .await
@@ -1960,8 +1997,46 @@ impl DownloadManager {
                                         }
                                         Err(e) => {
                                             error!("0延迟启动：准备任务失败: {}", e);
-                                            let mut t = task_clone.lock().await;
-                                            t.mark_failed(e.to_string());
+                                            // 🔥 释放已分配的槽位
+                                            let (slot_id, is_backup, is_folder_subtask, retry_count) = {
+                                                let t = task_clone.lock().await;
+                                                (t.slot_id, t.is_backup, t.group_id.is_some(), t.start_retry_count)
+                                            };
+                                            if let Some(sid) = slot_id {
+                                                task_slot_pool_clone.release_fixed_slot(&id_clone).await;
+                                                info!("0延迟启动：准备失败，释放槽位 {} (任务: {})", sid, id_clone);
+                                            }
+
+                                            // 🔥 最大重试次数限制
+                                            const MAX_START_RETRIES: u32 = 3;
+
+                                            // 🔥 备份任务或文件夹子任务：检查重试次数后决定是否重试
+                                            if (is_backup || is_folder_subtask) && retry_count < MAX_START_RETRIES {
+                                                warn!(
+                                                    "0延迟启动：任务 {} 准备失败（{}），放回等待队列等待重试 (重试 {}/{}, is_backup={}, is_folder_subtask={})",
+                                                    id_clone, e, retry_count + 1, MAX_START_RETRIES, is_backup, is_folder_subtask
+                                                );
+                                                {
+                                                    let mut t = task_clone.lock().await;
+                                                    t.status = TaskStatus::Pending;
+                                                    t.slot_id = None;
+                                                    t.error = Some(e.to_string());
+                                                    t.start_retry_count += 1;
+                                                }
+                                                // 放回等待队列末尾
+                                                waiting_queue_clone.write().await.push_back(id_clone.clone());
+                                            } else {
+                                                // 普通单文件任务或重试次数已达上限：标记失败
+                                                if retry_count >= MAX_START_RETRIES {
+                                                    error!(
+                                                        "0延迟启动：任务 {} 重试次数已达上限 ({})，标记为失败",
+                                                        id_clone, MAX_START_RETRIES
+                                                    );
+                                                }
+                                                let mut t = task_clone.lock().await;
+                                                t.mark_failed(e.to_string());
+                                                t.slot_id = None;
+                                            }
                                             cancellation_tokens_clone
                                                 .write()
                                                 .await
@@ -3328,6 +3403,7 @@ impl DownloadManager {
             // 自动备份字段（从 metadata 恢复）
             is_backup: metadata.is_backup,
             backup_config_id: metadata.backup_config_id.clone(),
+            start_retry_count: 0,
             // 解密字段（历史任务默认无解密）
             is_encrypted: false,
             decrypt_progress: 0.0,

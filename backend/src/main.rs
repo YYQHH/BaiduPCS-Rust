@@ -1,10 +1,16 @@
 use axum::{
+    middleware,
     routing::{delete, get, post, put},
     Json, Router,
 };
-use baidu_netdisk_rust::{config::LogConfig, logging, server::handlers, server::websocket, AppState};
+use baidu_netdisk_rust::{
+    config::LogConfig, logging, server::handlers, server::websocket,
+    web_auth::{self, WebAuthState},
+    AppState,
+};
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -97,6 +103,37 @@ async fn load_log_config() -> LogConfig {
     LogConfig::default()
 }
 
+/// 初始化 Web 认证状态
+///
+/// 从配置和凭证文件加载认证状态，并根据认证模式启动清理任务。
+async fn init_web_auth_state(config: &baidu_netdisk_rust::config::WebAuthConfig) -> Arc<WebAuthState> {
+    use baidu_netdisk_rust::web_auth::create_auth_store;
+
+    // 创建凭证存储并加载
+    let auth_store = Arc::new(create_auth_store());
+    if let Err(e) = auth_store.load().await {
+        tracing::warn!("加载认证凭证失败，使用空凭证: {}", e);
+    }
+
+    // 获取凭证
+    let credentials = auth_store.get_credentials().await;
+
+    // 创建认证状态
+    let state = WebAuthState::new(
+        config.clone(),
+        credentials,
+        None, // JWT 密钥自动生成
+        auth_store,
+    );
+
+    let state = Arc::new(state);
+
+    // 根据认证模式启动清理任务
+    state.start_cleanup_tasks().await;
+
+    state
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 🔥 先尝试加载日志配置，失败时使用默认配置
@@ -115,6 +152,10 @@ async fn main() -> anyhow::Result<()> {
     // 获取配置
     let config = app_state.config.read().await.clone();
     let addr = format!("{}:{}", config.server.host, config.server.port);
+
+    // 🔥 初始化 Web 认证状态
+    let web_auth_state = init_web_auth_state(&config.web_auth).await;
+    info!("Web 认证状态初始化完成 (模式: {:?})", config.web_auth.mode);
 
     // 配置中间件层
     let middleware = ServiceBuilder::new()
@@ -246,7 +287,27 @@ async fn main() -> anyhow::Result<()> {
         .route("/config/autobackup/trigger", put(handlers::autobackup::update_trigger_config))
         // 🔥 WebSocket 路由
         .route("/ws", get(websocket::handle_websocket))
-        .with_state(app_state.clone());
+        .with_state(app_state.clone())
+        // 🔥 应用 Web 认证中间件到所有 API 路由
+        .layer(middleware::from_fn_with_state(
+            web_auth_state.clone(),
+            web_auth::web_auth_middleware,
+        ));
+
+    // 🔥 Web 访问认证 API 路由（使用独立的 WebAuthState）
+    let web_auth_routes = Router::new()
+        .route("/login", post(web_auth::login))
+        .route("/refresh", post(web_auth::refresh))
+        .route("/logout", post(web_auth::logout))
+        .route("/status", get(web_auth::status))
+        .route("/config", get(web_auth::get_config))
+        .route("/config", put(web_auth::update_config))
+        .route("/password/set", post(web_auth::set_password))
+        .route("/totp/setup", post(web_auth::totp_setup))
+        .route("/totp/verify", post(web_auth::totp_verify))
+        .route("/totp/disable", post(web_auth::totp_disable))
+        .route("/recovery-codes/regenerate", post(web_auth::regenerate_recovery_codes))
+        .with_state(web_auth_state.clone());
 
     // 自动检测前端资源目录
     let frontend_dir = detect_frontend_dir();
@@ -274,6 +335,7 @@ async fn main() -> anyhow::Result<()> {
     // 构建完整应用
     let app = Router::new()
         .nest("/api/v1", api_routes)
+        .nest("/api/v1/web-auth", web_auth_routes)
         .route("/health", get(health_check))
         .fallback_service(static_service)
         .layer(middleware);
@@ -302,6 +364,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 🔥 优雅关闭
+    info!("正在关闭 Web 认证清理任务...");
+    web_auth_state.stop_cleanup_tasks().await;
     info!("正在关闭持久化管理器...");
     app_state.shutdown().await;
     info!("应用已安全退出");

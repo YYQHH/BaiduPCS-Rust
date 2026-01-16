@@ -13,6 +13,9 @@ pub use env_detector::{EnvDetector, EnvInfo, OsType};
 pub use mount_detector::{MountDetector, MountPoint};
 pub use path_validator::{PathValidationResult, PathValidator};
 
+// Re-export WebAuthConfig from web_auth module
+pub use crate::web_auth::{AuthMode, WebAuthConfig};
+
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -38,6 +41,9 @@ pub struct AppConfig {
     /// 自动备份配置
     #[serde(default)]
     pub autobackup: AutoBackupConfig,
+    /// Web 访问认证配置
+    #[serde(default)]
+    pub web_auth: WebAuthConfig,
 }
 
 /// 自动备份配置
@@ -878,6 +884,7 @@ impl Default for AppConfig {
             persistence: PersistenceConfig::default(),
             log: LogConfig::default(),
             autobackup: AutoBackupConfig::default(),
+            web_auth: WebAuthConfig::default(),
         }
     }
 }
