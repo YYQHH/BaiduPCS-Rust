@@ -62,6 +62,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '离线下载' }
       },
       {
+        path: '/shares',
+        name: 'Shares',
+        component: () => import('@/views/SharesView.vue'),
+        meta: { title: '分享管理' }
+      },
+      {
         path: '/settings',
         name: 'Settings',
         component: () => import('@/views/SettingsView.vue'),

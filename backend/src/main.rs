@@ -232,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
         // 转存API
         .route("/transfers", post(handlers::create_transfer))
         .route("/transfers", get(handlers::get_all_transfers))
+        .route("/transfers/cleanup", post(handlers::cleanup_orphaned_temp_dirs))
         .route("/transfers/:id", get(handlers::get_transfer))
         .route("/transfers/:id", delete(handlers::delete_transfer))
         .route("/transfers/:id/cancel", post(handlers::cancel_transfer))
@@ -280,6 +281,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/encryption/key/export", get(handlers::autobackup::export_encryption_key))
         .route("/encryption/key", delete(handlers::autobackup::delete_encryption_key))
         .route("/encryption/key/force", delete(handlers::autobackup::force_delete_encryption_key))
+        // 🔥 加密数据导出 API
+        .route("/encryption/export-bundle", post(handlers::export_bundle))
+        .route("/encryption/export-mapping", get(handlers::export_mapping))
+        .route("/encryption/export-keys", get(handlers::export_keys))
         // 🔥 离线下载 API
         .route("/cloud-dl/tasks", post(handlers::cloud_dl::add_task))
         .route("/cloud-dl/tasks", get(handlers::cloud_dl::list_tasks))
@@ -288,6 +293,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/cloud-dl/tasks/:task_id", get(handlers::cloud_dl::query_task))
         .route("/cloud-dl/tasks/:task_id", delete(handlers::cloud_dl::delete_task))
         .route("/cloud-dl/tasks/:task_id/cancel", post(handlers::cloud_dl::cancel_task))
+        // 🔥 分享 API
+        .route("/shares", post(handlers::create_share))
+        .route("/shares", get(handlers::get_share_list))
+        .route("/shares/cancel", post(handlers::cancel_share))
+        .route("/shares/:id", get(handlers::get_share_detail))
         // 🔥 系统能力检测 API
         .route("/system/watch-capability", get(handlers::autobackup::get_watch_capability))
         // 🔥 自动备份全局触发配置 API

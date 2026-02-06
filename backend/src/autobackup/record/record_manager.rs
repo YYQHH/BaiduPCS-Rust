@@ -1,5 +1,5 @@
 //! 备份记录管理器（去重服务）
-//! 
+//!
 //! 使用 SQLite 存储备份记录，支持：
 //! - 上传记录（用于上传去重）
 //! - 下载记录（用于下载去重）
@@ -58,6 +58,13 @@ impl BackupRecordManager {
     /// 获取数据库连接
     fn get_conn(&self) -> Result<DbConnection> {
         self.pool.get().map_err(|e| anyhow!("Failed to get db connection: {}", e))
+    }
+
+    /// 获取数据库连接（用于导出功能）
+    ///
+    /// 提供公开的数据库连接访问，用于 MappingGenerator 导出映射数据
+    pub fn get_conn_for_export(&self) -> Result<DbConnection> {
+        self.get_conn()
     }
 
     /// 初始化数据库表

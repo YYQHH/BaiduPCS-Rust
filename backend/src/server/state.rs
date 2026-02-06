@@ -308,6 +308,9 @@ impl AppState {
                 &pm_arc,
             )
                 .await;
+
+            // 🔥 启动时清理孤立临时目录（如果配置启用）
+            transfer_manager_arc.cleanup_orphaned_on_startup_if_enabled().await;
         }
 
         // 🔥 启动 WebSocket 批量发送器

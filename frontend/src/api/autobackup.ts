@@ -104,22 +104,22 @@ export type BackupFileStatus = 'pending' | 'checking' | 'skipped' | 'encrypting'
 
 /** 过滤原因类型 */
 export type FilterReasonType =
-  | { extension_not_included: string }
-  | { extension_excluded: string }
-  | { directory_excluded: string }
-  | { file_too_large: { size: number; max: number } }
-  | { file_too_small: { size: number; min: number } }
-  | 'hidden_file'
-  | 'system_file'
-  | 'temp_file'
+    | { extension_not_included: string }
+    | { extension_excluded: string }
+    | { directory_excluded: string }
+    | { file_too_large: { size: number; max: number } }
+    | { file_too_small: { size: number; min: number } }
+    | 'hidden_file'
+    | 'system_file'
+    | 'temp_file'
 
 /** 跳过原因 */
 export type SkipReason =
-  | 'already_exists'
-  | 'unchanged'
-  | { filtered: FilterReasonType }
-  | 'user_cancelled'
-  | 'config_disabled'
+    | 'already_exists'
+    | 'unchanged'
+    | { filtered: FilterReasonType }
+    | 'user_cancelled'
+    | 'config_disabled'
 
 /** 单个文件的备份任务 */
 export interface BackupFileTask {
@@ -365,6 +365,159 @@ export async function deleteEncryptionKey(): Promise<void> {
   if (!response.data.success) {
     throw new Error(response.data.error || '删除密钥失败')
   }
+}
+
+// ==================== 解密数据导出 API ====================
+
+/** 密钥信息 */
+export interface KeyInfo {
+  /** 主密钥（Base64 编码） */
+  master_key: string
+  /** 加密算法 */
+  algorithm: string
+  /** 密钥版本 */
+  key_version: number
+  /** 创建时间（Unix 时间戳，毫秒） */
+  created_at: number
+  /** 最后使用时间 */
+  last_used_at?: number
+  /** 废弃时间（仅历史密钥） */
+  deprecated_at?: number
+}
+
+/** 密钥导出响应 */
+export interface KeyExportResponse {
+  /** 当前密钥信息 */
+  current_key: KeyInfo
+  /** 历史密钥列表 */
+  key_history: KeyInfo[]
+}
+
+/** 映射记录 */
+export interface MappingRecord {
+  /** 配置 ID */
+  config_id: string
+  /** 加密后的文件名 */
+  encrypted_name: string
+  /** 原始文件路径 */
+  original_path: string
+  /** 原始文件名 */
+  original_name: string
+  /** 是否为目录 */
+  is_directory: boolean
+  /** 版本号 */
+  version: number
+  /** 密钥版本 */
+  key_version: number
+  /** 文件大小 */
+  file_size: number
+  /** Nonce（Base64 编码） */
+  nonce: string
+  /** 加密算法 */
+  algorithm: string
+  /** 远程路径（可选） */
+  remote_path?: string
+  /** 状态（可选） */
+  status?: string
+}
+
+/** 映射导出响应 */
+export interface MappingExportResponse {
+  /** 映射记录列表 */
+  records: MappingRecord[]
+  /** 导出时间 */
+  exported_at: string
+  /** 版本号 */
+  version: string
+}
+
+/**
+ * 导出解密数据包（ZIP 格式）
+ * 包含 encryption.json 和 mapping.json
+ */
+export async function exportDecryptBundle(): Promise<void> {
+  const response = await rawApiClient.post('/encryption/export-bundle', {}, {
+    responseType: 'blob',
+  })
+
+  // 从响应头获取文件名
+  const contentDisposition = response.headers['content-disposition']
+  let filename = 'decrypt_bundle.zip'
+  if (contentDisposition) {
+    const match = contentDisposition.match(/filename="?([^";\n]+)"?/)
+    if (match) {
+      filename = match[1]
+    }
+  }
+
+  // 创建下载链接
+  const blob = new Blob([response.data], { type: 'application/zip' })
+  const url = window.URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  window.URL.revokeObjectURL(url)
+}
+
+/**
+ * 导出映射数据（JSON 格式）
+ */
+export async function exportMapping(): Promise<MappingExportResponse> {
+  const response = await rawApiClient.get<ApiResponse<MappingExportResponse>>('/encryption/export-mapping')
+  if (response.data.success && response.data.data) {
+    return response.data.data
+  }
+  throw new Error(response.data.error || '导出映射失败')
+}
+
+/**
+ * 导出密钥配置（JSON 格式）
+ */
+export async function exportKeys(): Promise<KeyExportResponse> {
+  const response = await rawApiClient.get<ApiResponse<KeyExportResponse>>('/encryption/export-keys')
+  if (response.data.success && response.data.data) {
+    return response.data.data
+  }
+  throw new Error(response.data.error || '导出密钥失败')
+}
+
+/**
+ * 下载映射数据为 JSON 文件
+ */
+export async function downloadMappingJson(): Promise<void> {
+  const mapping = await exportMapping()
+  const json = JSON.stringify(mapping, null, 2)
+  const blob = new Blob([json], { type: 'application/json' })
+  const url = window.URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  link.download = `mapping_${timestamp}.json`
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  window.URL.revokeObjectURL(url)
+}
+
+/**
+ * 下载密钥配置为 JSON 文件
+ */
+export async function downloadKeysJson(): Promise<void> {
+  const keys = await exportKeys()
+  const json = JSON.stringify(keys, null, 2)
+  const blob = new Blob([json], { type: 'application/json' })
+  const url = window.URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  link.download = `encryption_${timestamp}.json`
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  window.URL.revokeObjectURL(url)
 }
 
 // ==================== 状态和统计 API ====================

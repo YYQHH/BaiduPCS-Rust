@@ -2061,10 +2061,17 @@ impl NetdiskClient {
                 transferred_fs_ids: vec![],
             })
         } else if errno == 4 {
+            // errno=4 可能是"文件重复"或"请求超时"，使用百度返回的 show_msg
+            let show_msg = json["show_msg"].as_str().unwrap_or("").to_string();
+            let error_msg = if show_msg.is_empty() {
+                "文件重复".to_string()
+            } else {
+                show_msg
+            };
             Ok(crate::transfer::TransferResult {
                 success: false,
                 transferred_paths: vec![],
-                error: Some("文件重复".to_string()),
+                error: Some(error_msg),
                 transferred_fs_ids: vec![],
             })
         } else {
@@ -2661,6 +2668,377 @@ impl NetdiskClient {
         info!("清空离线任务成功: total={}", api_response.total);
         Ok(api_response.total)
     }
+
+    // =====================================================
+    // 分享链接相关 API
+    // =====================================================
+
+    /// 创建分享链接
+    ///
+    /// # 参数
+    /// * `paths` - 文件路径列表
+    /// * `period` - 有效期（0=永久, 1=1天, 7=7天, 30=30天）
+    /// * `pwd` - 提取码（4位字符）
+    ///
+    /// # API
+    /// POST https://pan.baidu.com/share/pset
+    /// Content-Type: application/x-www-form-urlencoded
+    /// 参数: path_list=["path1","path2"], schannel=4, channel_list=[], period=7, pwd=xxxx, share_type=9
+    ///
+    /// # 返回
+    /// ShareSetResponse 包含 link, pwd, shareid
+    pub async fn share_set(
+        &self,
+        paths: &[String],
+        period: i32,
+        pwd: &str,
+    ) -> Result<crate::netdisk::ShareSetResponse> {
+        info!(
+            "创建分享链接: paths={:?}, period={}, pwd={}",
+            paths, period, pwd
+        );
+
+        // 构建 path_list JSON 数组
+        let path_list = serde_json::to_string(paths).context("序列化路径列表失败")?;
+
+        let url = "https://pan.baidu.com/share/pset";
+
+        let response = self
+            .client
+            .post(url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", "https://pan.baidu.com/disk/home")
+            .form(&[
+                ("path_list", path_list.as_str()),
+                ("period", &period.to_string()),
+                ("pwd", pwd),
+                ("schannel", "4"),
+                ("channel_list", "[]"),
+                ("share_type", "9"),
+            ])
+            .send()
+            .await
+            .context("创建分享链接请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取分享响应失败")?;
+
+        info!(
+            "创建分享链接响应: status={}, body={}",
+            status, response_text
+        );
+
+        let share_response: crate::netdisk::ShareSetResponse =
+            serde_json::from_str(&response_text).context("解析分享响应失败")?;
+
+        if share_response.is_success() {
+            info!(
+                "创建分享链接成功: link={}, shareid={}",
+                share_response.link, share_response.shareid
+            );
+        } else {
+            warn!(
+                "创建分享链接失败: errno={}, errmsg={}",
+                share_response.errno, share_response.errmsg
+            );
+        }
+
+        Ok(share_response)
+    }
+
+    /// 取消分享
+    ///
+    /// # 参数
+    /// * `share_ids` - 分享ID列表
+    ///
+    /// # API
+    /// POST https://pan.baidu.com/share/cancel
+    /// 参数: shareid_list=[123,456]
+    ///
+    /// # 返回
+    /// ShareCancelResponse
+    pub async fn share_cancel(
+        &self,
+        share_ids: &[u64],
+    ) -> Result<crate::netdisk::ShareCancelResponse> {
+        info!("取消分享: share_ids={:?}", share_ids);
+
+        // 构建 shareid_list JSON 数组
+        let shareid_list = serde_json::to_string(share_ids).context("序列化分享ID列表失败")?;
+
+        let url = "https://pan.baidu.com/share/cancel";
+
+        let response = self
+            .client
+            .post(url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", "https://pan.baidu.com/disk/home")
+            .form(&[("shareid_list", shareid_list.as_str())])
+            .send()
+            .await
+            .context("取消分享请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取取消分享响应失败")?;
+
+        info!("取消分享响应: status={}, body={}", status, response_text);
+
+        let cancel_response: crate::netdisk::ShareCancelResponse =
+            serde_json::from_str(&response_text).context("解析取消分享响应失败")?;
+
+        if cancel_response.is_success() {
+            info!("取消分享成功");
+        } else {
+            warn!(
+                "取消分享失败: errno={}, errmsg={}",
+                cancel_response.errno, cancel_response.errmsg
+            );
+        }
+
+        Ok(cancel_response)
+    }
+
+    /// 获取分享列表
+    ///
+    /// # 参数
+    /// * `page` - 页码（从1开始）
+    ///
+    /// # API
+    /// GET https://pan.baidu.com/share/record?page=1&desc=1&order=time
+    ///
+    /// # 返回
+    /// ShareListResponse
+    pub async fn share_list(&self, page: u32) -> Result<crate::netdisk::ShareListResponse> {
+        info!("获取分享列表: page={}", page);
+
+        let url = "https://pan.baidu.com/share/record";
+        let page_str = page.to_string();
+
+        let response = self
+            .client
+            .get(url)
+            .query(&[
+                ("page", page_str.as_str()),
+                ("desc", "1"),
+                ("order", "time"),
+            ])
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", "https://pan.baidu.com/disk/home")
+            .send()
+            .await
+            .context("获取分享列表请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取分享列表响应失败")?;
+
+        // 临时使用 info 级别日志查看响应内容
+        info!("获取分享列表响应: status={}, body={}", status, response_text);
+
+        let list_response: crate::netdisk::ShareListResponse =
+            serde_json::from_str(&response_text).context("解析分享列表响应失败")?;
+
+        if list_response.is_success() {
+            info!(
+                "获取分享列表成功: total={}, count={}",
+                list_response.total,
+                list_response.list.len()
+            );
+        } else {
+            warn!(
+                "获取分享列表失败: errno={}, errmsg={}",
+                list_response.errno, list_response.errmsg
+            );
+        }
+
+        Ok(list_response)
+    }
+
+    /// 获取分享详情（包含提取码）
+    ///
+    /// # 参数
+    /// * `share_id` - 分享ID
+    ///
+    /// # API
+    /// GET https://pan.baidu.com/share/surlinfoinrecord?shareid=xxx&sign=xxx
+    /// 注意: sign 需要使用 ShareSURLInfoSign 算法生成
+    ///
+    /// # 返回
+    /// ShareSURLInfoResponse（pwd="0" 时表示无密码，会转换为空字符串）
+    pub async fn share_surl_info(
+        &self,
+        share_id: u64,
+    ) -> Result<crate::netdisk::ShareSURLInfoResponse> {
+        info!("获取分享详情: share_id={}", share_id);
+
+        // 使用签名算法生成 sign
+        let sign = crate::sign::share_surl_info_sign(share_id);
+
+        let url = "https://pan.baidu.com/share/surlinfoinrecord";
+
+        let response = self
+            .client
+            .get(url)
+            .query(&[
+                ("shareid", share_id.to_string().as_str()),
+                ("sign", sign.as_str()),
+            ])
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", "https://pan.baidu.com/disk/home")
+            .send()
+            .await
+            .context("获取分享详情请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取分享详情响应失败")?;
+
+        debug!(
+            "获取分享详情响应: status={}, body={}",
+            status, response_text
+        );
+
+        let mut info_response: crate::netdisk::ShareSURLInfoResponse =
+            serde_json::from_str(&response_text).context("解析分享详情响应失败")?;
+
+        // 处理 pwd="0" 的情况，转换为空字符串
+        if info_response.pwd == "0" {
+            info_response.pwd = String::new();
+        }
+
+        if info_response.is_success() {
+            info!(
+                "获取分享详情成功: shorturl={}, has_pwd={}",
+                info_response.shorturl,
+                !info_response.pwd.is_empty()
+            );
+        } else {
+            warn!(
+                "获取分享详情失败: errno={}, errmsg={}",
+                info_response.errno, info_response.errmsg
+            );
+        }
+
+        Ok(info_response)
+    }
+
+    // =====================================================
+    // 文件删除相关 API
+    // =====================================================
+
+    /// 删除网盘文件/文件夹
+    ///
+    /// # 参数
+    /// * `paths` - 要删除的文件/文件夹路径列表
+    ///
+    /// # API
+    /// POST https://pan.baidu.com/api/filemanager?opera=delete&async=2&onnest=fail&bdstoken=xxx&newVerify=1&clienttype=0&app_id=250528&web=1
+    /// Content-Type: application/x-www-form-urlencoded
+    /// Body: filelist=["path1","path2"]
+    ///
+    /// # 返回
+    /// DeleteFilesResponse（可能部分成功）
+    ///
+    /// # 示例
+    /// ```ignore
+    /// let response = client.delete_files(&["/test/file.txt".to_string()]).await?;
+    /// if response.success {
+    ///     println!("删除成功: {} 个文件", response.deleted_count);
+    /// } else {
+    ///     println!("删除失败: {:?}", response.failed_paths);
+    /// }
+    /// ```
+    pub async fn delete_files(
+        &self,
+        paths: &[String],
+    ) -> Result<crate::netdisk::DeleteFilesResponse> {
+        use crate::netdisk::DeleteFilesResponse;
+
+        if paths.is_empty() {
+            return Ok(DeleteFilesResponse::success(0));
+        }
+
+        info!("删除网盘文件: paths={:?}", paths);
+
+        // 获取 bdstoken
+        let bdstoken = {
+            let token_guard = self.bdstoken.lock().await;
+            match token_guard.as_ref() {
+                Some(token) if !token.is_empty() => token.clone(),
+                _ => return Err(anyhow::anyhow!("bdstoken 尚未获取，无法删除文件")),
+            }
+        };
+
+        // 构建 filelist JSON: ["/path1","/path2"]
+        let filelist_json = serde_json::to_string(paths).context("序列化文件列表失败")?;
+
+        debug!("删除文件 filelist: {}", filelist_json);
+
+        // 使用 Web API 删除文件（与网页端一致）
+        let url = format!(
+            "https://pan.baidu.com/api/filemanager?opera=delete&async=2&onnest=fail&bdstoken={}&newVerify=1&clienttype=0&app_id={}&web=1",
+            urlencoding::encode(&bdstoken),
+            BAIDU_APP_ID
+        );
+
+        // 收集 cookies 并创建独立 client（与 create_folder 一致）
+        let merged_cookie_str = self.collect_all_baidu_cookies().await?;
+        let pan_client = reqwest::Client::builder()
+            .cookie_store(false)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("User-Agent", HeaderValue::from_str(&self.web_user_agent)?);
+        headers.insert("Cookie", HeaderValue::from_str(&merged_cookie_str)?);
+
+        let response = pan_client
+            .post(&url)
+            .headers(headers)
+            .form(&[("filelist", filelist_json.as_str())])
+            .send()
+            .await
+            .context("删除文件请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取删除文件响应失败")?;
+
+        info!(
+            "删除文件响应: status={}, body={}",
+            status, response_text
+        );
+
+        // 解析响应
+        let api_response: crate::netdisk::DeleteFilesApiResponse =
+            serde_json::from_str(&response_text).context("解析删除文件响应失败")?;
+
+        if api_response.is_success() {
+            info!("删除文件成功: {} 个文件", paths.len());
+            Ok(DeleteFilesResponse::success(paths.len()))
+        } else {
+            // API 返回错误
+            let error_msg = if api_response.errmsg.is_empty() {
+                format!("删除失败: errno={}", api_response.errno)
+            } else {
+                api_response.errmsg.clone()
+            };
+
+            // errno 12: 文件不存在（可能已被删除），视为成功（幂等性）
+            if api_response.errno == 12 {
+                warn!("文件不存在，视为删除成功");
+                Ok(DeleteFilesResponse::success(paths.len()))
+            } else {
+                error!(
+                    "删除文件失败: errno={}, errmsg={}",
+                    api_response.errno, error_msg
+                );
+                Ok(DeleteFilesResponse::failure(error_msg))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2737,5 +3115,89 @@ mod tests {
         // 测试无效链接
         let result = client.parse_share_link("https://google.com/file");
         assert!(result.is_err());
+    }
+
+    // =====================================================
+    // DeleteFilesResponse 单元测试
+    // =====================================================
+
+    #[test]
+    fn test_delete_files_response_success() {
+        use crate::netdisk::DeleteFilesResponse;
+
+        // 测试成功响应
+        let response = DeleteFilesResponse::success(3);
+        assert!(response.success);
+        assert!(response.error.is_none());
+        assert!(response.failed_paths.is_empty());
+        assert_eq!(response.deleted_count, 3);
+    }
+
+    #[test]
+    fn test_delete_files_response_partial_success() {
+        use crate::netdisk::DeleteFilesResponse;
+
+        // 测试部分成功响应
+        let failed_paths = vec!["/test/file1.txt".to_string(), "/test/file2.txt".to_string()];
+        let response = DeleteFilesResponse::partial_success(5, failed_paths.clone());
+
+        assert!(!response.success);
+        assert!(response.error.is_some());
+        assert!(response.error.as_ref().unwrap().contains("部分文件删除失败"));
+        assert_eq!(response.failed_paths, failed_paths);
+        assert_eq!(response.deleted_count, 5);
+    }
+
+    #[test]
+    fn test_delete_files_response_failure() {
+        use crate::netdisk::DeleteFilesResponse;
+
+        // 测试失败响应
+        let error_msg = "网络错误".to_string();
+        let response = DeleteFilesResponse::failure(error_msg.clone());
+
+        assert!(!response.success);
+        assert_eq!(response.error, Some(error_msg));
+        assert!(response.failed_paths.is_empty());
+        assert_eq!(response.deleted_count, 0);
+    }
+
+    #[test]
+    fn test_delete_files_api_response_success() {
+        use crate::netdisk::DeleteFilesApiResponse;
+
+        // 测试 API 成功响应解析
+        let json = r#"{"errno": 0, "errmsg": "", "request_id": 12345}"#;
+        let response: DeleteFilesApiResponse = serde_json::from_str(json).unwrap();
+
+        assert!(response.is_success());
+        assert_eq!(response.errno, 0);
+        assert_eq!(response.request_id, 12345);
+    }
+
+    #[test]
+    fn test_delete_files_api_response_error() {
+        use crate::netdisk::DeleteFilesApiResponse;
+
+        // 测试 API 错误响应解析
+        let json = r#"{"errno": 31066, "errmsg": "文件不存在", "request_id": 12345}"#;
+        let response: DeleteFilesApiResponse = serde_json::from_str(json).unwrap();
+
+        assert!(!response.is_success());
+        assert_eq!(response.errno, 31066);
+        assert_eq!(response.errmsg, "文件不存在");
+    }
+
+    #[test]
+    fn test_delete_files_api_response_partial_fields() {
+        use crate::netdisk::DeleteFilesApiResponse;
+
+        // 测试部分字段缺失的响应解析
+        let json = r#"{"errno": 0}"#;
+        let response: DeleteFilesApiResponse = serde_json::from_str(json).unwrap();
+
+        assert!(response.is_success());
+        assert_eq!(response.errmsg, "");
+        assert_eq!(response.request_id, 0);
     }
 }

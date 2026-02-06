@@ -195,6 +195,15 @@ pub struct TaskMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transfer_file_name: Option<String>,
 
+    // === 分享直下相关字段 ===
+    /// 是否为分享直下任务
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_share_direct_download: Option<bool>,
+
+    /// 临时目录路径（网盘路径，分享直下专用，用于清理）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_dir: Option<String>,
+
     // === 文件夹下载组信息 ===
     /// 文件夹下载组ID（单文件下载时为 None）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,6 +306,9 @@ impl TaskMetadata {
             share_info_json: None,
             auto_download: None,
             transfer_file_name: None,
+            // 分享直下字段
+            is_share_direct_download: None,
+            temp_dir: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -362,6 +374,9 @@ impl TaskMetadata {
             share_info_json: None,
             auto_download: None,
             transfer_file_name: None,
+            // 分享直下字段
+            is_share_direct_download: None,
+            temp_dir: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -423,6 +438,9 @@ impl TaskMetadata {
             share_info_json: None,
             auto_download: None,
             transfer_file_name: None,
+            // 分享直下字段
+            is_share_direct_download: None,
+            temp_dir: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -486,6 +504,9 @@ impl TaskMetadata {
             share_info_json: None,
             auto_download: None,
             transfer_file_name: None,
+            // 分享直下字段
+            is_share_direct_download: None,
+            temp_dir: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -543,6 +564,9 @@ impl TaskMetadata {
             share_info_json: None,
             auto_download: Some(auto_download),
             transfer_file_name: file_name,
+            // 分享直下字段
+            is_share_direct_download: None,
+            temp_dir: None,
             group_id: None,
             group_root: None,
             relative_path: None,
@@ -657,6 +681,21 @@ impl TaskMetadata {
     /// * `local_path` - 新的本地路径
     pub fn set_local_path(&mut self, local_path: PathBuf) {
         self.local_path = Some(local_path);
+        self.touch();
+    }
+
+    /// 设置分享直下相关字段
+    ///
+    /// # Arguments
+    /// * `is_share_direct_download` - 是否为分享直下任务
+    /// * `temp_dir` - 临时目录路径（网盘路径）
+    pub fn set_share_direct_download_info(
+        &mut self,
+        is_share_direct_download: bool,
+        temp_dir: Option<String>,
+    ) {
+        self.is_share_direct_download = Some(is_share_direct_download);
+        self.temp_dir = temp_dir;
         self.touch();
     }
 

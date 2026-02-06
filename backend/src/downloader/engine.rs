@@ -2631,7 +2631,7 @@ impl DownloadEngine {
             let slot_touch_throttler = if let Some(ref pool) = task_slot_pool {
                 // 获取 group_id（如果是文件夹子任务，使用文件夹 ID；否则使用任务 ID）
                 let touch_id = {
-                    let t = task.blocking_lock();
+                    let t = task.lock().await;
                     t.group_id.clone().unwrap_or_else(|| task_id.clone())
                 };
                 Some(Arc::new(crate::task_slot_pool::SlotTouchThrottler::new(pool.clone(), touch_id)))

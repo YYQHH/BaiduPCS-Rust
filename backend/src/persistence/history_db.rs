@@ -1222,6 +1222,9 @@ impl HistoryDbManager {
             share_info_json: None,
             auto_download: row.auto_download.map(|v| v != 0),
             transfer_file_name: row.transfer_file_name,
+            // 分享直下字段
+            is_share_direct_download: None,
+            temp_dir: None,
             group_id: row.group_id,
             group_root: row.group_root,
             relative_path: row.relative_path,

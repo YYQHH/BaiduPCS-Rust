@@ -102,6 +102,11 @@ pub struct DownloadTask {
     /// 原始文件名（解密后恢复的文件名）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_filename: Option<String>,
+
+    // === 🔥 分享直下相关字段 ===
+    /// 是否为分享直下任务（完成后不自动清除，由转存管理器清理）
+    #[serde(default)]
+    pub is_share_direct_download: bool,
 }
 
 impl DownloadTask {
@@ -137,6 +142,8 @@ impl DownloadTask {
             decrypt_progress: 0.0,
             decrypted_path: None,
             original_filename: None,
+            // 分享直下字段初始化
+            is_share_direct_download: false,
         }
     }
 

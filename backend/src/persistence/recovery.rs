@@ -473,12 +473,16 @@ pub struct TransferRecoveryInfo {
     pub share_pwd: Option<String>,
     /// 转存目标路径
     pub target_path: String,
-    /// 转存状态（checking_share, transferring, transferred, downloading, completed）
+    /// 转存状态（checking_share, transferring, transferred, downloading, cleaning, completed）
     pub status: Option<String>,
     /// 关联的下载任务 ID 列表
     pub download_task_ids: Vec<String>,
     /// 创建时间
     pub created_at: i64,
+    /// 临时目录路径（分享直下专用，用于清理）
+    pub temp_dir: Option<String>,
+    /// 是否为分享直下任务
+    pub is_share_direct_download: bool,
 }
 
 impl TransferRecoveryInfo {
@@ -494,6 +498,8 @@ impl TransferRecoveryInfo {
             status: metadata.transfer_status.clone(),
             download_task_ids: metadata.download_task_ids.clone(),
             created_at: metadata.created_at.timestamp(),
+            temp_dir: metadata.temp_dir.clone(),
+            is_share_direct_download: metadata.is_share_direct_download.unwrap_or(false),
         })
     }
 }
@@ -528,6 +534,9 @@ pub struct DownloadRecoveryInfo {
     pub group_root: Option<String>,
     /// 相对于根文件夹的路径
     pub relative_path: Option<String>,
+    // === 跨任务跳转字段 ===
+    /// 关联的转存任务 ID（如果此下载任务由转存任务自动创建）
+    pub transfer_task_id: Option<String>,
     // === 自动备份字段 ===
     /// 是否为备份任务
     pub is_backup: bool,
@@ -559,6 +568,8 @@ impl DownloadRecoveryInfo {
             group_id: metadata.group_id.clone(),
             group_root: metadata.group_root.clone(),
             relative_path: metadata.relative_path.clone(),
+            // 恢复跨任务跳转字段
+            transfer_task_id: metadata.transfer_task_id.clone(),
             // 恢复备份标识
             is_backup: metadata.is_backup,
             backup_config_id: metadata.backup_config_id.clone(),

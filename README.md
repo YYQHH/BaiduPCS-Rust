@@ -155,6 +155,63 @@ BaiduPCS-Rust 是一个使用 Rust 和 Vue 3 构建的现代化百度网盘第�
 > - `config/encryption.json`：加密密钥文件（建议同时使用界面的"导出密钥"功能备份）
 > - `config/baidu-pcs.db`：数据库文件，包含加密映射表（记录加密文件与原始文件名的对应关系）
 
+### 🔓 独立解密工具 (decrypt-cli)
+
+为了方便用户在没有主程序的情况下解密文件，我们提供了独立的命令行解密工具 `decrypt-cli`。
+
+**特性：**
+- ✅ 独立运行，无需启动主程序
+- ✅ 支持批量解密和单文件解密
+- ✅ 支持 AES-256-GCM 和 ChaCha20-Poly1305 算法
+- ✅ 跨平台支持（Windows、Linux、macOS）
+
+**下载：** 从 [Releases](https://github.com/komorebiCarry/BaiduPCS-Rust/releases) 页面下载对应平台的 `decrypt-cli` 可执行文件。
+
+<details>
+<summary>📖 <b>decrypt-cli 使用说明</b>（点击展开）</summary>
+
+#### 准备工作
+
+解密前需要准备以下文件：
+1. `encryption.json` - 加密密钥文件（从主程序导出或备份）
+2. `mapping.json` - 加密映射文件（批量解密时需要，可从主程序导出）
+3. 加密的文件（`.dat` 文件）
+
+#### 批量解密模式
+
+```bash
+# 恢复原始目录结构（使用映射文件中的原始路径）
+decrypt-cli decrypt --key-file encryption.json --map mapping.json --in-dir ./encrypted --out-dir ./decrypted
+
+# 镜像输入目录结构（按 --in-dir 的目录结构输出）
+decrypt-cli decrypt --key-file encryption.json --map mapping.json --in-dir ./encrypted --out-dir ./decrypted --mirror
+```
+
+#### 单文件解密模式
+
+```bash
+# 自动尝试所有密钥
+decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt
+
+# 指定密钥版本
+decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --key-version 2
+```
+
+#### 参数说明
+
+| 参数 | 说明 |
+|------|------|
+| `--key-file` | 密钥配置文件路径（必需） |
+| `--map` | 映射文件路径（批量模式必需） |
+| `--in-dir` | 输入目录（批量模式） |
+| `--out-dir` | 输出目录（批量模式） |
+| `--in` | 单个输入文件（单文件模式） |
+| `--out` | 单个输出文件（单文件模式） |
+| `--key-version` | 指定密钥版本（单文件模式可选） |
+| `--mirror` | 镜像输入目录结构，而不是恢复原始路径 |
+
+</details>
+
 <details>
 <summary>📖 <b>加密映射原理说明</b>（点击展开）</summary>
 
@@ -196,7 +253,18 @@ BaiduPCS-Rust 是一个使用 Rust 和 Vue 3 构建的现代化百度网盘第�
 
 ## 📋 最新版本
 
-### v1.8.1 (当前版本)
+### v1.9.0 (当前版本)
+
+**主要更新：**
+- ✨ **分享直下功能**：支持粘贴百度网盘分享链接并选择本地下载目录，后端会在网盘临时目录中完成转存，下载完成后按配置自动清理临时文件，避免长期占用网盘空间
+- ✨ **分享管理页面**：新增“分享管理”页面，集中查看我的分享记录，支持复制链接和提取码、单个/批量取消分享
+- ✨ **独立解密工具 decrypt-cli**：新增独立命令行解密工具，可在未部署主程序的环境下解密加密文件，支持批量解密和单文件解密，兼容 AES-256-GCM 与 ChaCha20-Poly1305
+- 🔧 **下载 0 速度场景修复**
+
+<details>
+<summary><b>v1.8.1 / v1.8.0 版本详情</b>（点击展开）</summary>
+
+#### v1.8.1
 
 **问题修复：**
 - 🐛 **修复任务槽超时释放问题**：新增槽位刷新节流器（`SlotTouchThrottler`），在任务进度更新时定期刷新槽位时间戳，防止正常任务因长时间无进度更新被误判为过期而释放
@@ -204,8 +272,7 @@ BaiduPCS-Rust 是一个使用 Rust 和 Vue 3 构建的现代化百度网盘第�
     - 当槽位因超时被自动释放时，自动将对应任务状态设置为失败，并通过 WebSocket 通知用户
     - 解决了大文件下载/上传时，因进度更新间隔较长导致槽位被误释放的问题
 
-<details>
-<summary><b>v1.8.0 版本详情</b>（点击展开）</summary>
+#### v1.8.0
 
 **主要新功能：**
 - ✨ **离线下载功能**：支持通过百度网盘服务器代为下载资源

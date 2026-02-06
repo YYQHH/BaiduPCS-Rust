@@ -471,3 +471,270 @@ impl UploadErrorKind {
         }
     }
 }
+
+
+// =====================================================
+// 分享相关类型定义
+// =====================================================
+
+/// 创建分享响应
+///
+/// 百度网盘 API: POST /share/pset
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareSetResponse {
+    /// 错误码（0表示成功）
+    pub errno: i32,
+
+    /// 分享链接
+    #[serde(default)]
+    pub link: String,
+
+    /// 提取码
+    #[serde(default)]
+    pub pwd: String,
+
+    /// 分享ID
+    #[serde(default)]
+    pub shareid: u64,
+
+    /// 错误信息
+    #[serde(default)]
+    pub errmsg: String,
+}
+
+impl ShareSetResponse {
+    /// 是否成功
+    pub fn is_success(&self) -> bool {
+        self.errno == 0 && !self.link.is_empty() && self.shareid > 0
+    }
+}
+
+/// 取消分享响应
+///
+/// 百度网盘 API: POST /share/cancel
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareCancelResponse {
+    /// 错误码（0表示成功）
+    pub errno: i32,
+
+    /// 错误信息
+    #[serde(default)]
+    pub errmsg: String,
+}
+
+impl ShareCancelResponse {
+    /// 是否成功
+    pub fn is_success(&self) -> bool {
+        self.errno == 0
+    }
+}
+
+/// 分享记录
+///
+/// 分享列表中的单条记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareRecord {
+    /// 分享ID
+    #[serde(rename = "shareId")]
+    pub share_id: u64,
+
+    /// 文件ID列表
+    #[serde(rename = "fsIds", default)]
+    pub fs_ids: Vec<i64>,
+
+    /// 短链接
+    #[serde(default)]
+    pub shortlink: String,
+
+    /// 状态（0=正常, 其他=异常）
+    pub status: i32,
+
+    /// 是否公开（0=私密, 1=公开）
+    pub public: i32,
+
+    /// 文件类型
+    #[serde(rename = "typicalCategory", default)]
+    pub typical_category: i32,
+
+    /// 文件路径
+    #[serde(rename = "typicalPath", default)]
+    pub typical_path: String,
+
+    /// 过期类型（0=永久, 1=1天, 7=7天, 30=30天）
+    #[serde(rename = "expiredType", default)]
+    pub expired_type: i32,
+
+    /// 过期时间戳（0表示永久）
+    #[serde(rename = "expiredTime", default)]
+    pub expired_time: i64,
+
+    /// 浏览次数
+    #[serde(rename = "vCnt", default)]
+    pub view_count: i32,
+}
+
+impl ShareRecord {
+    /// 是否正常状态
+    pub fn is_active(&self) -> bool {
+        self.status == 0
+    }
+
+    /// 是否永久有效
+    pub fn is_permanent(&self) -> bool {
+        self.expired_type == 0 || self.expired_time == 0
+    }
+
+    /// 获取文件名（从路径中提取）
+    pub fn filename(&self) -> &str {
+        self.typical_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.typical_path)
+    }
+}
+
+/// 分享列表响应
+///
+/// 百度网盘 API: GET /share/record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareListResponse {
+    /// 错误码（0表示成功）
+    pub errno: i32,
+
+    /// 分享记录列表
+    #[serde(default)]
+    pub list: Vec<ShareRecord>,
+
+    /// 总数
+    #[serde(default)]
+    pub total: u32,
+
+    /// 错误信息
+    #[serde(default)]
+    pub errmsg: String,
+}
+
+impl ShareListResponse {
+    /// 是否成功
+    pub fn is_success(&self) -> bool {
+        self.errno == 0
+    }
+}
+
+/// 分享详情响应（ShareSURLInfo）
+///
+/// 百度网盘 API: GET /share/surlinfoinrecord
+/// 用于获取分享的提取码等详细信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareSURLInfoResponse {
+    /// 错误码（0表示成功）
+    pub errno: i32,
+
+    /// 提取码（注意：值为"0"时表示无密码，需要转换为空字符串）
+    #[serde(default)]
+    pub pwd: String,
+
+    /// 短链接
+    #[serde(default)]
+    pub shorturl: String,
+
+    /// 错误信息
+    #[serde(default)]
+    pub errmsg: String,
+}
+
+impl ShareSURLInfoResponse {
+    /// 是否成功
+    pub fn is_success(&self) -> bool {
+        self.errno == 0
+    }
+
+    /// 获取实际的提取码
+    /// 当 pwd 为 "0" 时表示无密码，返回空字符串
+    pub fn actual_pwd(&self) -> &str {
+        if self.pwd == "0" {
+            ""
+        } else {
+            &self.pwd
+        }
+    }
+}
+
+
+// =====================================================
+// 删除文件相关类型定义
+// =====================================================
+
+/// 删除文件响应
+///
+/// 百度网盘 API: POST https://pcs.baidu.com/rest/2.0/pcs/file?method=delete
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteFilesResponse {
+    /// 是否全部成功
+    pub success: bool,
+    /// 错误信息（如果有）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// 删除失败的路径列表
+    #[serde(default)]
+    pub failed_paths: Vec<String>,
+    /// 成功删除的数量
+    pub deleted_count: usize,
+}
+
+impl DeleteFilesResponse {
+    /// 创建成功响应
+    pub fn success(deleted_count: usize) -> Self {
+        Self {
+            success: true,
+            error: None,
+            failed_paths: Vec::new(),
+            deleted_count,
+        }
+    }
+
+    /// 创建部分成功响应
+    pub fn partial_success(deleted_count: usize, failed_paths: Vec<String>) -> Self {
+        Self {
+            success: false,
+            error: Some(format!("部分文件删除失败: {} 个", failed_paths.len())),
+            failed_paths,
+            deleted_count,
+        }
+    }
+
+    /// 创建失败响应
+    pub fn failure(error: String) -> Self {
+        Self {
+            success: false,
+            error: Some(error),
+            failed_paths: Vec::new(),
+            deleted_count: 0,
+        }
+    }
+}
+
+/// 删除文件 API 原始响应
+///
+/// 百度 PCS API 返回的原始 JSON 格式
+#[derive(Debug, Deserialize)]
+pub struct DeleteFilesApiResponse {
+    /// 错误码（0表示成功）
+    #[serde(default)]
+    pub errno: i32,
+
+    /// 错误信息
+    #[serde(default)]
+    pub errmsg: String,
+
+    /// 请求ID
+    #[serde(default)]
+    pub request_id: u64,
+}
+
+impl DeleteFilesApiResponse {
+    /// 是否成功
+    pub fn is_success(&self) -> bool {
+        self.errno == 0
+    }
+}

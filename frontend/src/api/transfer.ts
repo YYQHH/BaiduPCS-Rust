@@ -19,6 +19,12 @@ export const TransferErrorCodes = {
   MANAGER_NOT_READY: 1005,
   /** 任务不存在 */
   TASK_NOT_FOUND: 1006,
+  /** 网盘空间不足 */
+  INSUFFICIENT_SPACE: 1007,
+  /** 转存失败 */
+  TRANSFER_FAILED: 1008,
+  /** 下载失败 */
+  DOWNLOAD_FAILED: 1009,
 } as const
 
 // ============================================
@@ -34,6 +40,7 @@ export type TransferStatus =
     | 'transferred'
     | 'downloading'
     | 'download_failed'
+    | 'cleaning'  // 分享直下专用：清理临时文件中
     | 'completed'
 
 /// 分享页面信息
@@ -76,16 +83,22 @@ export interface TransferTask {
   download_started_at?: number
   /** 🔥 新增：转存文件名称（用于展示，从分享文件列表中提取） */
   file_name?: string
+  /** 分享直下：是否为分享直下任务 */
+  is_share_direct_download?: boolean
+  /** 分享直下：临时目录路径（网盘路径） */
+  temp_dir?: string
 }
 
 /// 创建转存任务请求
 export interface CreateTransferRequest {
   share_url: string
   password?: string
-  save_path: string
+  save_path?: string
   save_fs_id: number
   auto_download?: boolean
   local_download_path?: string
+  /** 分享直下：是否为分享直下任务 */
+  is_share_direct_download?: boolean
 }
 
 /// 创建转存任务响应
@@ -99,6 +112,14 @@ export interface CreateTransferResponse {
 export interface TransferListResponse {
   tasks: TransferTask[]
   total: number
+}
+
+/// 清理孤立目录响应
+export interface CleanupOrphanedResponse {
+  /** 成功删除的目录数 */
+  deleted_count: number
+  /** 删除失败的目录路径列表 */
+  failed_paths: string[]
 }
 
 /// 转存 API 错误
@@ -148,6 +169,16 @@ export async function cancelTransfer(taskId: string): Promise<string> {
   return apiClient.post(`/transfers/${taskId}/cancel`)
 }
 
+/**
+ * 清理孤立的临时目录
+ *
+ * 扫描临时目录下的所有子目录，找出不属于任何活跃任务的目录（孤立目录），
+ * 然后删除这些孤立目录。
+ */
+export async function cleanupOrphanedTempDirs(): Promise<CleanupOrphanedResponse> {
+  return apiClient.post('/transfers/cleanup')
+}
+
 // ============================================
 // 辅助函数
 // ============================================
@@ -164,6 +195,7 @@ export function getTransferStatusText(status: TransferStatus): string {
     transferred: '已转存',
     downloading: '下载中',
     download_failed: '下载失败',
+    cleaning: '清理临时文件中',  // 分享直下专用
     completed: '已完成',
   }
   return statusMap[status] || '未知'
@@ -181,6 +213,7 @@ export function getTransferStatusType(status: TransferStatus): 'success' | 'warn
     transferred: 'success',
     downloading: 'warning',
     download_failed: 'danger',
+    cleaning: 'warning',  // 分享直下专用
     completed: 'success',
   }
   return typeMap[status] || 'info'

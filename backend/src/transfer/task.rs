@@ -22,6 +22,8 @@ pub enum TransferStatus {
     Downloading,
     /// 下载失败
     DownloadFailed,
+    /// 清理临时文件中（分享直下专用）
+    Cleaning,
     /// 全部完成
     Completed,
 }
@@ -37,6 +39,7 @@ impl TransferStatus {
             TransferStatus::Transferred => "已转存",
             TransferStatus::Downloading => "下载中",
             TransferStatus::DownloadFailed => "下载失败",
+            TransferStatus::Cleaning => "清理临时文件中",
             TransferStatus::Completed => "已完成",
         }
     }
@@ -104,6 +107,14 @@ pub struct TransferTask {
     /// 转存文件名称（用于展示，从分享文件列表中提取）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
+
+    // === 分享直下相关字段 ===
+    /// 是否为分享直下任务
+    #[serde(default)]
+    pub is_share_direct_download: bool,
+    /// 临时目录路径（网盘路径，分享直下专用，用于清理）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_dir: Option<String>,
 }
 
 impl TransferTask {
@@ -138,6 +149,8 @@ impl TransferTask {
             completed_download_ids: Vec::new(),
             download_started_at: None,
             file_name: None,
+            is_share_direct_download: false,
+            temp_dir: None,
         }
     }
 
@@ -188,6 +201,12 @@ impl TransferTask {
     /// 标记下载失败
     pub fn mark_download_failed(&mut self) {
         self.status = TransferStatus::DownloadFailed;
+        self.touch();
+    }
+
+    /// 标记为清理临时文件中（分享直下专用）
+    pub fn mark_cleaning(&mut self) {
+        self.status = TransferStatus::Cleaning;
         self.touch();
     }
 
@@ -308,6 +327,7 @@ mod tests {
         assert!(TransferStatus::Transferred.is_terminal());
         assert!(!TransferStatus::Downloading.is_terminal());
         assert!(TransferStatus::DownloadFailed.is_terminal());
+        assert!(!TransferStatus::Cleaning.is_terminal());
         assert!(TransferStatus::Completed.is_terminal());
     }
 }

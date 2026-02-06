@@ -48,6 +48,11 @@
           <template #title>离线下载</template>
         </el-menu-item>
 
+        <el-menu-item index="/shares">
+          <el-icon><Share /></el-icon>
+          <template #title>分享管理</template>
+        </el-menu-item>
+
         <el-menu-item index="/settings">
           <el-icon><Setting /></el-icon>
           <template #title>系统设置</template>
@@ -115,6 +120,11 @@
           <el-menu-item index="/cloud-dl">
             <el-icon><Link /></el-icon>
             <span>离线下载</span>
+          </el-menu-item>
+
+          <el-menu-item index="/shares">
+            <el-icon><Share /></el-icon>
+            <span>分享管理</span>
           </el-menu-item>
 
           <el-menu-item index="/settings">
@@ -282,6 +292,7 @@ const pageTitle = computed(() => {
     '/transfers': '转存管理',
     '/autobackup': '自动备份',
     '/cloud-dl': '离线下载',
+    '/shares': '分享管理',
     '/settings': '系统设置',
   }
   return titles[route.path] || '百度网盘'

@@ -44,6 +44,9 @@ pub struct AppConfig {
     /// Web 访问认证配置
     #[serde(default)]
     pub web_auth: WebAuthConfig,
+    /// 分享直下配置
+    #[serde(default)]
+    pub share_direct_download: ShareDirectDownloadConfig,
 }
 
 /// 自动备份配置
@@ -214,6 +217,64 @@ impl Default for AutoBackupConfig {
             config_path: default_config_path(),
             upload_trigger: UploadTriggerConfig::default(),
             download_trigger: DownloadTriggerConfig::default(),
+        }
+    }
+}
+
+/// 分享直下配置
+///
+/// 用于配置分享直下功能的行为：
+/// - 临时目录路径（网盘上的临时存储位置）
+/// - 自动清理选项
+/// - 失败时清理选项
+/// - 启动时清理孤立目录选项
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareDirectDownloadConfig {
+    /// 临时目录路径（网盘上的路径，用于存放转存的文件）
+    /// 默认: /.bpr_share_temp/
+    #[serde(default = "default_share_direct_temp_dir")]
+    pub temp_dir: String,
+
+    /// 下载完成后是否自动清理临时目录
+    /// 默认: true
+    #[serde(default = "default_share_direct_auto_cleanup")]
+    pub auto_cleanup: bool,
+
+    /// 下载失败时是否清理临时目录
+    /// 默认: true
+    #[serde(default = "default_share_direct_cleanup_on_failure")]
+    pub cleanup_on_failure: bool,
+
+    /// 启动时是否清理孤立的临时目录（不属于任何活跃任务的目录）
+    /// 默认: false（避免误删用户数据）
+    #[serde(default = "default_share_direct_cleanup_orphaned_on_startup")]
+    pub cleanup_orphaned_on_startup: bool,
+}
+
+// 分享直下配置默认值函数
+fn default_share_direct_temp_dir() -> String {
+    "/.bpr_share_temp/".to_string()
+}
+
+fn default_share_direct_auto_cleanup() -> bool {
+    true
+}
+
+fn default_share_direct_cleanup_on_failure() -> bool {
+    true
+}
+
+fn default_share_direct_cleanup_orphaned_on_startup() -> bool {
+    false
+}
+
+impl Default for ShareDirectDownloadConfig {
+    fn default() -> Self {
+        Self {
+            temp_dir: default_share_direct_temp_dir(),
+            auto_cleanup: default_share_direct_auto_cleanup(),
+            cleanup_on_failure: default_share_direct_cleanup_on_failure(),
+            cleanup_orphaned_on_startup: default_share_direct_cleanup_orphaned_on_startup(),
         }
     }
 }
@@ -885,6 +946,7 @@ impl Default for AppConfig {
             log: LogConfig::default(),
             autobackup: AutoBackupConfig::default(),
             web_auth: WebAuthConfig::default(),
+            share_direct_download: ShareDirectDownloadConfig::default(),
         }
     }
 }
@@ -1276,5 +1338,50 @@ mod tests {
         // 验证 cdn_refresh 配置被正确包含
         assert_eq!(download_config.cdn_refresh.enabled, false);
         assert_eq!(download_config.cdn_refresh.refresh_interval_minutes, 15);
+    }
+
+    #[test]
+    fn test_share_direct_download_config_default() {
+        let config = ShareDirectDownloadConfig::default();
+
+        // 验证默认值
+        assert_eq!(config.temp_dir, "/.bpr_share_temp/");
+        assert!(config.auto_cleanup);
+        assert!(config.cleanup_on_failure);
+        assert!(!config.cleanup_orphaned_on_startup);
+    }
+
+    #[test]
+    fn test_share_direct_download_config_serialization() {
+        // 测试序列化和反序列化
+        let config = ShareDirectDownloadConfig {
+            temp_dir: "/.custom_temp/".to_string(),
+            auto_cleanup: false,
+            cleanup_on_failure: false,
+            cleanup_orphaned_on_startup: true,
+        };
+
+        // 序列化为 TOML
+        let toml_str = toml::to_string(&config).unwrap();
+
+        // 反序列化
+        let deserialized: ShareDirectDownloadConfig = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(deserialized.temp_dir, "/.custom_temp/");
+        assert!(!deserialized.auto_cleanup);
+        assert!(!deserialized.cleanup_on_failure);
+        assert!(deserialized.cleanup_orphaned_on_startup);
+    }
+
+    #[test]
+    fn test_app_config_includes_share_direct_download() {
+        // 测试 AppConfig 包含 share_direct_download 配置
+        let config = AppConfig::default();
+
+        // 验证 share_direct_download 配置被正确包含
+        assert_eq!(config.share_direct_download.temp_dir, "/.bpr_share_temp/");
+        assert!(config.share_direct_download.auto_cleanup);
+        assert!(config.share_direct_download.cleanup_on_failure);
+        assert!(!config.share_direct_download.cleanup_orphaned_on_startup);
     }
 }

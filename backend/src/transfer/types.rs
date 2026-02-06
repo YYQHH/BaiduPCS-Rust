@@ -2,6 +2,29 @@
 
 use serde::{Deserialize, Serialize};
 
+// ============================================
+// 错误码常量定义
+// ============================================
+
+/// 需要提取码
+pub const ERROR_NEED_PASSWORD: i32 = 2001;
+/// 提取码错误
+pub const ERROR_INVALID_PASSWORD: i32 = 2002;
+/// 分享已失效
+pub const ERROR_SHARE_EXPIRED: i32 = 2003;
+/// 分享不存在
+pub const ERROR_SHARE_NOT_FOUND: i32 = 2004;
+/// 网盘空间不足
+pub const ERROR_INSUFFICIENT_SPACE: i32 = 2005;
+/// 转存失败
+pub const ERROR_TRANSFER_FAILED: i32 = 2006;
+/// 下载失败
+pub const ERROR_DOWNLOAD_FAILED: i32 = 2007;
+/// 任务不存在
+pub const ERROR_TASK_NOT_FOUND: i32 = 2008;
+/// 清理临时目录失败（分享直下专用）
+pub const ERROR_CLEANUP_FAILED: i32 = 2009;
+
 /// 分享链接解析结果
 #[derive(Debug, Clone)]
 pub struct ShareLink {

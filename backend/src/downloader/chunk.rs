@@ -6,7 +6,7 @@ use tokio::{
     fs::File,
     io::{AsyncSeekExt, AsyncWriteExt},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// 默认分片大小: 5MB
 pub const DEFAULT_CHUNK_SIZE: u64 = 5 * 1024 * 1024;
@@ -118,8 +118,31 @@ impl Chunk {
         let mut total_bytes_downloaded = 0u64;
         let mut pending_progress = 0u64; // 累积的待更新字节数
         const PROGRESS_UPDATE_THRESHOLD: u64 = 256 * 1024; // 每256KB更新一次进度（减少锁竞争）
+        // 🔥 读取超时：防止CDN连接挂起导致分片线程永久卡死
+        // 当服务端返回headers后数据流停止时，reqwest的全局timeout不会生效，
+        // 需要对每次stream.next()单独设置超时
+        const READ_TIMEOUT_SECS: u64 = 30;
 
-        while let Some(chunk_result) = stream.next().await {
+        loop {
+            let chunk_result = match tokio::time::timeout(
+                std::time::Duration::from_secs(READ_TIMEOUT_SECS),
+                stream.next(),
+            )
+                .await
+            {
+                Ok(Some(result)) => result,
+                Ok(None) => break, // 流结束
+                Err(_) => {
+                    warn!(
+                        "[分片线程{}] 分片 #{} 读取超时({}秒无数据)，已下载 {} bytes",
+                        chunk_thread_id, self.index, READ_TIMEOUT_SECS, total_bytes_downloaded
+                    );
+                    anyhow::bail!(
+                        "读取数据流超时: {}秒内无数据到达",
+                        READ_TIMEOUT_SECS
+                    );
+                }
+            };
             let chunk_data = chunk_result.context("读取数据流失败")?;
             let chunk_len = chunk_data.len() as u64;
 

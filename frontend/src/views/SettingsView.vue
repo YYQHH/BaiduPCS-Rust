@@ -437,6 +437,45 @@
                 </el-button>
               </div>
 
+              <!-- 导出解密数据区域 -->
+              <el-divider v-if="encryptionStatus?.has_key" content-position="left">导出解密数据</el-divider>
+              <div v-if="encryptionStatus?.has_key" class="export-decrypt-section">
+                <el-alert
+                    type="warning"
+                    :closable="false"
+                    show-icon
+                    style="margin-bottom: 16px"
+                >
+                  <template #title>
+                    <strong>安全提示：</strong>导出的数据包含敏感的加密密钥和文件映射信息，请妥善保管！
+                  </template>
+                </el-alert>
+
+                <div class="export-actions">
+                  <el-button type="primary" @click="handleExportDecryptBundle" :loading="exportingBundle">
+                    <el-icon><Download /></el-icon>
+                    导出解密数据包
+                  </el-button>
+                  <el-dropdown @command="handleSeparateExport" trigger="click">
+                    <el-button :loading="exportingSeparate">
+                      <el-icon><Document /></el-icon>
+                      分别导出
+                      <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+                    </el-button>
+                    <template #dropdown>
+                      <el-dropdown-menu>
+                        <el-dropdown-item command="keys">导出密钥配置 (encryption.json)</el-dropdown-item>
+                        <el-dropdown-item command="mapping">导出映射数据 (mapping.json)</el-dropdown-item>
+                      </el-dropdown-menu>
+                    </template>
+                  </el-dropdown>
+                </div>
+
+                <div class="form-tip" style="margin-top: 12px">
+                  <strong>解密数据包</strong>：包含 encryption.json（密钥配置）和 mapping.json（文件映射），可配合 decrypt-cli 工具在其他机器上解密文件。
+                </div>
+              </div>
+
               <el-alert type="warning" :closable="false" show-icon style="margin-top: 16px">
                 <template #title>
                   <strong>重要提示：</strong>请妥善保管加密密钥。如果密钥丢失，将无法解密已加密的文件！
@@ -524,13 +563,13 @@
                 <el-form-item v-if="triggerConfig.upload_trigger.fallback_interval_enabled" label="间隔时间（分钟）">
                   <el-input-number
                       v-model="triggerConfig.upload_trigger.fallback_interval_minutes"
-                      :min="5"
+                      :min="10"
                       :max="1440"
-                      :step="5"
+                      :step="10"
                       :disabled="!encryptionStatus?.has_key"
                       @change="handleTriggerConfigChange"
                   />
-                  <div class="form-tip">每隔指定时间进行一次增量扫描</div>
+                  <div class="form-tip">每隔指定时间进行一次增量扫描（最小 10 分钟，防止触发风控）</div>
                 </el-form-item>
 
                 <!-- 指定时间全量扫描 -->
@@ -576,7 +615,7 @@
                     :disabled="!encryptionStatus?.has_key"
                     @change="handleTriggerConfigChange"
                 />
-                <div class="form-tip">每隔指定时间检查云端文件变化</div>
+                <div class="form-tip">每隔指定时间检查云端文件变化（最小 10 分钟，防止触发风控）</div>
               </el-form-item>
 
               <el-form-item v-if="triggerConfig.download_trigger.poll_mode === 'scheduled'" label="轮询时间">
@@ -703,6 +742,8 @@ import {
   View,
   Hide,
   Refresh,
+  Document,
+  ArrowDown,
 } from '@element-plus/icons-vue'
 import { getTransferConfig, updateTransferConfig } from '@/api/config'
 import {
@@ -714,6 +755,9 @@ import {
   getWatchCapability,
   getTriggerConfig,
   updateTriggerConfig,
+  exportDecryptBundle,
+  downloadMappingJson,
+  downloadKeysJson,
   type EncryptionStatus,
   type WatchCapability,
   type GlobalTriggerConfig,
@@ -740,6 +784,10 @@ const encryptionKey = ref('')
 const keyAlgorithm = ref('AES-256-GCM')
 const showKeyDialog = ref(false)
 const showKey = ref(false)
+
+// 导出解密数据相关状态
+const exportingBundle = ref(false)
+const exportingSeparate = ref(false)
 
 // 自动备份相关状态
 const watchCapability = ref<WatchCapability | null>(null)
@@ -1096,6 +1144,65 @@ async function handleDeleteKey() {
   }
 }
 
+// 导出解密数据包
+async function handleExportDecryptBundle() {
+  try {
+    // 显示风险提示对话框
+    await ElMessageBox.confirm(
+        '导出的数据包包含敏感的加密密钥和文件映射信息。\n\n请注意：\n• 妥善保管导出的文件，避免泄露\n• 不要将文件上传到公共网络或分享给他人\n• 建议将文件存储在安全的离线位置',
+        '安全提示',
+        {
+          confirmButtonText: '我已了解，继续导出',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
+    )
+
+    exportingBundle.value = true
+    await exportDecryptBundle()
+    ElMessage.success('解密数据包导出成功')
+  } catch (error: any) {
+    if (error !== 'cancel') {
+      ElMessage.error('导出失败: ' + (error.message || '未知错误'))
+    }
+  } finally {
+    exportingBundle.value = false
+  }
+}
+
+// 分别导出密钥或映射
+async function handleSeparateExport(command: string) {
+  try {
+    // 显示风险提示对话框
+    await ElMessageBox.confirm(
+        command === 'keys'
+            ? '导出的密钥文件包含敏感的加密密钥信息。\n\n请注意：\n• 妥善保管导出的文件，避免泄露\n• 密钥丢失将无法解密已加密的文件'
+            : '导出的映射文件包含文件名和路径的对应关系。\n\n请注意：\n• 映射文件需要配合密钥文件使用\n• 妥善保管，避免泄露文件结构信息',
+        '安全提示',
+        {
+          confirmButtonText: '我已了解，继续导出',
+          cancelButtonText: '取消',
+          type: 'warning',
+        }
+    )
+
+    exportingSeparate.value = true
+    if (command === 'keys') {
+      await downloadKeysJson()
+      ElMessage.success('密钥配置导出成功')
+    } else if (command === 'mapping') {
+      await downloadMappingJson()
+      ElMessage.success('映射数据导出成功')
+    }
+  } catch (error: any) {
+    if (error !== 'cancel') {
+      ElMessage.error('导出失败: ' + (error.message || '未知错误'))
+    }
+  } finally {
+    exportingSeparate.value = false
+  }
+}
+
 // 复制到剪贴板
 function copyToClipboard(text: string) {
   navigator.clipboard.writeText(text)
@@ -1290,6 +1397,22 @@ onMounted(() => {
   }
 }
 
+// 导出解密数据区域样式
+.export-decrypt-section {
+  margin-top: 16px;
+}
+
+.export-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+
+  .el-button {
+    flex: 1;
+    min-width: 140px;
+  }
+}
+
 .key-input {
   font-family: monospace;
 }
@@ -1430,6 +1553,18 @@ onMounted(() => {
 
     .el-button {
       width: 100%;
+      margin-left: 0 !important;
+    }
+  }
+
+  // 导出解密数据按钮组 - 移动端垂直布局
+  .export-actions {
+    flex-direction: column;
+    gap: 8px;
+
+    .el-button {
+      width: 100%;
+      min-width: unset;
       margin-left: 0 !important;
     }
   }

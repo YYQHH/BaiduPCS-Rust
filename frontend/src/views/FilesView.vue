@@ -29,6 +29,14 @@
           <el-icon><Download /></el-icon>
           批量下载 ({{ selectedFiles.length }})
         </el-button>
+        <el-button
+            v-if="selectedFiles.length > 0"
+            type="info"
+            @click="handleBatchShare"
+        >
+          <el-icon><Link /></el-icon>
+          分享 ({{ selectedFiles.length }})
+        </el-button>
         <el-button type="primary" @click="showCreateFolderDialog">
           <el-icon><FolderAdd /></el-icon>
           新建文件夹
@@ -40,6 +48,10 @@
         <el-button type="warning" @click="showTransferDialog = true">
           <el-icon><Share /></el-icon>
           转存
+        </el-button>
+        <el-button type="danger" @click="showShareDirectDownloadDialog = true">
+          <el-icon><Download /></el-icon>
+          分享直下
         </el-button>
         <el-button type="primary" @click="refreshFileList">
           <el-icon><Refresh /></el-icon>
@@ -58,6 +70,14 @@
         >
           <el-icon><Download /></el-icon>
         </el-button>
+        <el-button
+            v-if="selectedFiles.length > 0"
+            type="info"
+            circle
+            @click="handleBatchShare"
+        >
+          <el-icon><Link /></el-icon>
+        </el-button>
         <el-button type="primary" circle @click="showCreateFolderDialog">
           <el-icon><FolderAdd /></el-icon>
         </el-button>
@@ -66,6 +86,9 @@
         </el-button>
         <el-button type="warning" circle @click="showTransferDialog = true">
           <el-icon><Share /></el-icon>
+        </el-button>
+        <el-button type="danger" circle @click="showShareDirectDownloadDialog = true" title="分享直下">
+          <el-icon><Download /></el-icon>
         </el-button>
         <el-button type="primary" circle @click="refreshFileList">
           <el-icon><Refresh /></el-icon>
@@ -127,8 +150,16 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="150" fixed="right">
+        <el-table-column label="操作" width="200" fixed="right">
           <template #default="{ row }">
+            <!-- 分享按钮 -->
+            <el-button
+                type="info"
+                size="small"
+                @click.stop="handleSingleShare(row)"
+            >
+              分享
+            </el-button>
             <!-- 文件下载按钮 -->
             <el-button
                 v-if="row.isdir === 0"
@@ -182,6 +213,14 @@
             </div>
           </div>
           <div class="file-card-action">
+            <el-button
+                type="info"
+                size="small"
+                circle
+                @click.stop="handleSingleShare(item)"
+            >
+              <el-icon><Link /></el-icon>
+            </el-button>
             <el-button
                 type="primary"
                 size="small"
@@ -260,6 +299,19 @@
         :current-path="currentDir"
         @success="handleTransferSuccess"
     />
+
+    <!-- 分享对话框 -->
+    <ShareDialog
+        v-model="showShareDialog"
+        :files="shareFiles"
+        @success="handleShareSuccess"
+    />
+
+    <!-- 分享直下对话框 -->
+    <ShareDirectDownloadDialog
+        v-model="showShareDirectDownloadDialog"
+        @success="handleShareDirectDownloadSuccess"
+    />
   </div>
 </template>
 
@@ -274,6 +326,8 @@ import {getConfig, updateRecentDirDebounced, setDefaultDownloadDir, type Downloa
 import {getEncryptionStatus} from '@/api/autobackup'
 import {FilePickerModal} from '@/components/FilePicker'
 import TransferDialog from '@/components/TransferDialog.vue'
+import ShareDialog from '@/components/ShareDialog.vue'
+import ShareDirectDownloadDialog from '@/components/ShareDirectDownloadDialog.vue'
 import type {FileEntry} from '@/api/filesystem'
 
 // 响应式检测
@@ -316,6 +370,13 @@ const pendingDownloadFile = ref<FileItem | null>(null)
 
 // 转存对话框状态
 const showTransferDialog = ref(false)
+
+// 分享对话框状态
+const showShareDialog = ref(false)
+const shareFiles = ref<FileItem[]>([])
+
+// 分享直下对话框状态
+const showShareDirectDownloadDialog = ref(false)
 
 // 路径分割
 const pathParts = computed(() => {
@@ -901,11 +962,47 @@ function handleTransferSuccess(taskId: string) {
   // 刷新文件列表以显示转存后的文件
   refreshFileList()
 }
+
+// ============================================
+// 分享相关函数
+// ============================================
+
+// 单个文件分享
+function handleSingleShare(file: FileItem) {
+  shareFiles.value = [file]
+  showShareDialog.value = true
+}
+
+// 批量分享（工具栏按钮）
+function handleBatchShare() {
+  if (selectedFiles.value.length === 0) {
+    ElMessage.warning('请先选择要分享的文件或文件夹')
+    return
+  }
+  shareFiles.value = [...selectedFiles.value]
+  showShareDialog.value = true
+}
+
+// 分享成功处理
+function handleShareSuccess() {
+  // 清空选择
+  selectedFiles.value = []
+}
+
+// ============================================
+// 分享直下相关函数
+// ============================================
+
+// 分享直下成功处理
+function handleShareDirectDownloadSuccess(taskId: string) {
+  console.log('分享直下任务创建成功:', taskId)
+  ElMessage.success('分享直下任务已创建')
+}
 </script>
 
 <script lang="ts">
 // 图标导入
-export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Download, Share, Loading} from '@element-plus/icons-vue'
+export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Download, Share, Loading, Link} from '@element-plus/icons-vue'
 </script>
 
 <style scoped lang="scss">
@@ -1094,6 +1191,8 @@ export {Folder, Document, Refresh, HomeFilled, Upload, ArrowDown, FolderAdd, Dow
   .file-card-action {
     flex-shrink: 0;
     margin-left: 12px;
+    display: flex;
+    gap: 8px;
   }
 }
 

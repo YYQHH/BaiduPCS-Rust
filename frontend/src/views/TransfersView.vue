@@ -14,6 +14,10 @@
             <el-icon><Share /></el-icon>
             新建转存
           </el-button>
+          <el-button type="success" @click="showShareDirectDialog = true">
+            <el-icon><Download /></el-icon>
+            分享直下
+          </el-button>
           <el-button @click="refreshTasks">
             <el-icon><Refresh /></el-icon>
             刷新
@@ -28,6 +32,9 @@
         <template v-else>
           <el-button type="primary" circle @click="showTransferDialog = true">
             <el-icon><Share /></el-icon>
+          </el-button>
+          <el-button type="success" circle @click="showShareDirectDialog = true">
+            <el-icon><Download /></el-icon>
           </el-button>
           <el-button circle @click="refreshTasks">
             <el-icon><Refresh /></el-icon>
@@ -66,6 +73,9 @@
                     {{ getTaskDisplayName(task) }}
                   </span>
                 </el-tooltip>
+                <el-tag v-if="task.is_share_direct_download" type="success" size="small">
+                  直下
+                </el-tag>
                 <el-tag :type="getTransferStatusType(task.status)" size="small">
                   {{ getTransferStatusText(task.status) }}
                 </el-tag>
@@ -180,6 +190,12 @@
         v-model="showTransferDialog"
         @success="handleTransferSuccess"
     />
+
+    <!-- 分享直下对话框 -->
+    <ShareDirectDownloadDialog
+        v-model="showShareDirectDialog"
+        @success="handleTransferSuccess"
+    />
   </div>
 </template>
 
@@ -193,6 +209,7 @@ import {
   CircleClose,
   Folder,
   Document,
+  Download,
 } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import { useIsMobile } from '@/utils/responsive'
@@ -210,6 +227,7 @@ import {
 } from '@/api/transfer'
 import { formatFileSize } from '@/api/file'
 import TransferDialog from '@/components/TransferDialog.vue'
+import ShareDirectDownloadDialog from '@/components/ShareDirectDownloadDialog.vue'
 // 🔥 WebSocket 相关导入
 import { getWebSocketClient, connectWebSocket, type ConnectionState } from '@/utils/websocket'
 import type { TransferEvent } from '@/types/events'
@@ -224,6 +242,7 @@ const isMobile = useIsMobile()
 const loading = ref(false)
 const tasks = ref<TransferTask[]>([])
 const showTransferDialog = ref(false)
+const showShareDirectDialog = ref(false)
 
 // 自动刷新定时器
 let refreshTimer: number | null = null
@@ -235,7 +254,7 @@ const wsConnected = ref(false)
 
 // 是否为活跃状态
 function isActiveStatus(status: TransferStatus): boolean {
-  return ['queued', 'checking_share', 'transferring', 'downloading'].includes(status)
+  return ['queued', 'checking_share', 'transferring', 'downloading', 'cleaning'].includes(status)
 }
 
 // 获取任务显示名称（优先显示文件名）

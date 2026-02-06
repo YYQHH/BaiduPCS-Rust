@@ -585,11 +585,12 @@ impl ChunkScheduler {
 
                 if scheduled_count > 0 {
                     debug!("本轮调度完成，共启动 {} 个分片", scheduled_count);
+                    // 有新分片启动，短暂延迟后继续调度
+                    tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+                } else {
+                    // 所有任务都达到并发上限或无待下载分片，延长等待避免空转
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                 }
-
-                // 短暂延迟，避免 CPU 占用过高
-                // 减少到 2ms 以提高响应速度
-                tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
             }
 
             info!("全局分片调度循环已停止");
@@ -812,9 +813,15 @@ impl ChunkScheduler {
                     debug!("下载任务 {} 已归档到历史数据库", task_id);
                 }
             }
-            if let Some(ref manager_tasks) = task_info.manager_tasks {
-                manager_tasks.write().await.remove(task_id);
-                debug!("下载任务 {} 已从 DownloadManager.tasks 中移除", task_id);
+            // 🔥 分享直下任务不从内存中移除，由转存管理器清理后移除
+            let is_share_direct_download = task_info.task.lock().await.is_share_direct_download;
+            if !is_share_direct_download {
+                if let Some(ref manager_tasks) = task_info.manager_tasks {
+                    manager_tasks.write().await.remove(task_id);
+                    debug!("下载任务 {} 已从 DownloadManager.tasks 中移除", task_id);
+                }
+            } else {
+                debug!("分享直下任务 {} 完成，保留在内存中等待转存管理器清理", task_id);
             }
         } else {
             if let Some(ref pm) = task_info.persistence_manager {
@@ -1235,24 +1242,27 @@ impl ChunkScheduler {
     /// 🔥 获取所有活跃任务的速度（仅速度值）
     ///
     /// ⚠️ 修复问题4：过滤掉未开始和已完成的任务，避免停滞误判
+    /// ⚠️ 修复问题5：使用任务状态判断，而非 progress > 0
+    ///    - 原逻辑：progress > 0 才纳入检测，导致一开始就卡住的任务无法触发 CDN 刷新
+    ///    - 新逻辑：状态为 Downloading 就纳入检测，即使 progress = 0
     ///
     /// # 返回
-    /// 只包含有效任务的速度列表（已开始且未完成的任务）
+    /// 只包含有效任务的速度列表（状态为 Downloading 且未完成的任务）
     pub async fn get_valid_task_speed_values(&self) -> Vec<u64> {
         let tasks = self.active_tasks.read().await;
         let mut speeds = Vec::new();
 
         for task_info in tasks.values() {
-            // 获取任务进度
-            let (progress_bytes, total_bytes) = {
+            // 获取任务状态和进度
+            let (status, progress_bytes, total_bytes) = {
                 let task = task_info.task.lock().await;
-                (task.downloaded_size, task_info.total_size)
+                (task.status.clone(), task.downloaded_size, task_info.total_size)
             };
 
-            // 过滤：只包含已开始且未完成的任务
-            // progress > 0: 已经开始下载
+            // 过滤：只包含正在下载且未完成的任务
+            // status == Downloading: 任务正在下载中（包括 progress = 0 的情况）
             // progress < total: 尚未完成
-            if progress_bytes > 0 && progress_bytes < total_bytes {
+            if status == crate::downloader::TaskStatus::Downloading && progress_bytes < total_bytes {
                 let speed = {
                     let calc = task_info.speed_calc.lock().await;
                     calc.speed()

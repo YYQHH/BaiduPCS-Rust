@@ -1,6 +1,6 @@
 [package]
 name = "baidu-netdisk-rust"
-version = "1.0.0"
+version = "1.9.0"
 edition = "2021"
 
 [dependencies]
@@ -84,6 +84,9 @@ regex = "1.12.2"
 
 # 系统信息（内存监控）
 sysinfo = "0.30"
+
+# ZIP 打包
+zip = "0.6"
 
 [dev-dependencies]
 # 测试工具

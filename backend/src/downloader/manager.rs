@@ -681,6 +681,7 @@ impl DownloadManager {
                         relative_path,
                         is_backup,
                         backup_config_id,
+                        transfer_task_id,
                     ) = {
                         let t = task_clone.lock().await;
                         (
@@ -693,6 +694,7 @@ impl DownloadManager {
                             t.relative_path.clone(),
                             t.is_backup,
                             t.backup_config_id.clone(),
+                            t.transfer_task_id.clone(),
                         )
                     };
 
@@ -787,12 +789,13 @@ impl DownloadManager {
                             backup_config_id.clone(),
                             is_encrypted,
                             encryption_key_version,
+                            transfer_task_id.clone(),
                         ) {
                             warn!("注册任务到持久化管理器失败: {}", e);
                         } else {
                             info!(
-                                "任务 {} 已注册到持久化管理器 ({} 个分片, is_backup={})",
-                                task_id_clone, total_chunks, is_backup
+                                "任务 {} 已注册到持久化管理器 ({} 个分片, is_backup={}, transfer_task_id={:?})",
+                                task_id_clone, total_chunks, is_backup, transfer_task_id
                             );
                         }
 
@@ -1249,6 +1252,7 @@ impl DownloadManager {
                                                 relative_path,
                                                 is_backup,
                                                 backup_config_id,
+                                                transfer_task_id,
                                             ) = {
                                                 let t = task_clone.lock().await;
                                                 (
@@ -1261,6 +1265,7 @@ impl DownloadManager {
                                                     t.relative_path.clone(),
                                                     t.is_backup,
                                                     t.backup_config_id.clone(),
+                                                    t.transfer_task_id.clone(),
                                                 )
                                             };
 
@@ -1355,6 +1360,7 @@ impl DownloadManager {
                                                     backup_config_id.clone(),
                                                     is_encrypted,
                                                     encryption_key_version,
+                                                    transfer_task_id.clone(),
                                                 ) {
                                                     warn!(
                                                         "后台监控：注册任务到持久化管理器失败: {}",
@@ -1766,6 +1772,7 @@ impl DownloadManager {
                                                 relative_path,
                                                 is_backup,
                                                 backup_config_id,
+                                                transfer_task_id,
                                             ) = {
                                                 let t = task_clone.lock().await;
                                                 (
@@ -1778,6 +1785,7 @@ impl DownloadManager {
                                                     t.relative_path.clone(),
                                                     t.is_backup,
                                                     t.backup_config_id.clone(),
+                                                    t.transfer_task_id.clone(),
                                                 )
                                             };
 
@@ -1872,6 +1880,7 @@ impl DownloadManager {
                                                     backup_config_id.clone(),
                                                     is_encrypted,
                                                     encryption_key_version,
+                                                    transfer_task_id.clone(),
                                                 ) {
                                                     warn!(
                                                         "0延迟启动：注册任务到持久化管理器失败: {}",
@@ -3284,6 +3293,45 @@ impl DownloadManager {
         }
     }
 
+    /// 设置任务为分享直下任务
+    ///
+    /// 分享直下任务完成后不会被 clear_completed 清除，由转存管理器负责清理
+    pub async fn set_task_share_direct_download(
+        &self,
+        task_id: &str,
+        is_share_direct_download: bool,
+    ) -> Result<()> {
+        let tasks = self.tasks.read().await;
+        if let Some(task) = tasks.get(task_id) {
+            let mut t = task.lock().await;
+            t.is_share_direct_download = is_share_direct_download;
+            Ok(())
+        } else {
+            anyhow::bail!("任务不存在: {}", task_id)
+        }
+    }
+
+    /// 清除指定的分享直下任务（由转存管理器调用）
+    ///
+    /// 用于转存管理器在清理临时文件后移除已完成的分享直下下载任务
+    pub async fn remove_share_direct_download_task(&self, task_id: &str) -> Result<()> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks.get(task_id) {
+            let t = task.lock().await;
+            if t.is_share_direct_download && t.status == TaskStatus::Completed {
+                drop(t);
+                tasks.remove(task_id);
+                info!("移除分享直下下载任务: {}", task_id);
+                Ok(())
+            } else {
+                anyhow::bail!("任务不是已完成的分享直下任务: {}", task_id)
+            }
+        } else {
+            // 任务不存在，可能已被移除，视为成功
+            Ok(())
+        }
+    }
+
     /// 获取所有任务（包括当前任务和历史任务，排除备份任务）
     pub async fn get_all_tasks(&self) -> Vec<DownloadTask> {
         let tasks = self.tasks.read().await;
@@ -3459,6 +3507,8 @@ impl DownloadManager {
             decrypt_progress: 0.0,
             decrypted_path: None,
             original_filename: None,
+            // 分享直下字段（历史任务默认为 false）
+            is_share_direct_download: false,
         })
     }
 
@@ -3473,10 +3523,10 @@ impl DownloadManager {
         let mut tasks = self.tasks.write().await;
         let mut to_remove = Vec::new();
 
-        // 1. 收集内存中的已完成任务
+        // 1. 收集内存中的已完成任务（跳过分享直下任务，由转存管理器清理）
         for (id, task) in tasks.iter() {
             let t = task.lock().await;
-            if t.status == TaskStatus::Completed {
+            if t.status == TaskStatus::Completed && !t.is_share_direct_download {
                 to_remove.push(id.clone());
             }
         }
@@ -3913,6 +3963,9 @@ impl DownloadManager {
         task.group_id = recovery_info.group_id.clone();
         task.group_root = recovery_info.group_root.clone();
         task.relative_path = recovery_info.relative_path.clone();
+
+        // 🔥 恢复跨任务跳转字段
+        task.transfer_task_id = recovery_info.transfer_task_id.clone();
 
         info!(
             "恢复下载任务: id={}, 文件={:?}, 已完成 {}/{} 分片 ({:.1}%), group_id={:?}{}",

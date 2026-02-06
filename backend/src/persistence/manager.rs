@@ -525,6 +525,7 @@ impl PersistenceManager {
     /// * `backup_config_id` - 备份配置ID（备份任务时使用）
     /// * `is_encrypted` - 是否为加密文件（可选）
     /// * `encryption_key_version` - 加密密钥版本（可选）
+    /// * `transfer_task_id` - 关联的转存任务 ID（可选，由转存任务自动创建的下载任务需要设置）
     pub fn register_download_task(
         &self,
         task_id: String,
@@ -541,6 +542,7 @@ impl PersistenceManager {
         backup_config_id: Option<String>,
         is_encrypted: Option<bool>,
         encryption_key_version: Option<u32>,
+        transfer_task_id: Option<String>,
     ) -> std::io::Result<()> {
         // 创建元数据
         let mut metadata = TaskMetadata::new_download(
@@ -562,6 +564,11 @@ impl PersistenceManager {
         metadata.is_backup = is_backup;
         metadata.backup_config_id = backup_config_id;
 
+        // 🔥 设置关联的转存任务 ID（解决调用顺序问题）
+        if let Some(ref tid) = transfer_task_id {
+            metadata.set_transfer_task_id(tid.clone());
+        }
+
         // 保存元数据到文件
         save_metadata(&self.wal_dir, &metadata)?;
 
@@ -569,7 +576,7 @@ impl PersistenceManager {
         let info = TaskPersistenceInfo::new_download(task_id.clone(), total_chunks);
         self.tasks.insert(task_id.clone(), info);
 
-        debug!("已注册下载任务: {} (is_backup={}, is_encrypted={:?})", task_id, is_backup, is_encrypted);
+        debug!("已注册下载任务: {} (is_backup={}, is_encrypted={:?}, transfer_task_id={:?})", task_id, is_backup, is_encrypted, transfer_task_id);
 
         Ok(())
     }
@@ -986,6 +993,30 @@ impl PersistenceManager {
         })?;
 
         debug!("已更新 upload_id: task_id={}", task_id);
+
+        Ok(())
+    }
+
+    /// 更新分享直下相关字段
+    ///
+    /// # Arguments
+    /// * `task_id` - 任务 ID
+    /// * `is_share_direct_download` - 是否为分享直下任务
+    /// * `temp_dir` - 临时目录路径（网盘路径）
+    pub fn update_share_direct_download_info(
+        &self,
+        task_id: &str,
+        is_share_direct_download: bool,
+        temp_dir: Option<String>,
+    ) -> std::io::Result<()> {
+        update_metadata(&self.wal_dir, task_id, move |m| {
+            m.set_share_direct_download_info(is_share_direct_download, temp_dir);
+        })?;
+
+        debug!(
+            "已更新分享直下信息: task_id={}, is_share_direct_download={}",
+            task_id, is_share_direct_download
+        );
 
         Ok(())
     }
@@ -1570,6 +1601,7 @@ mod tests {
                 None,
                 None,  // is_encrypted
                 None,  // encryption_key_version
+                None,  // transfer_task_id
             )
             .unwrap();
 
@@ -1647,6 +1679,7 @@ mod tests {
                 None,
                 None,  // is_encrypted
                 None,  // encryption_key_version
+                None,  // transfer_task_id
             )
             .unwrap();
 
@@ -1716,6 +1749,7 @@ mod tests {
                 None,
                 None,  // is_encrypted
                 None,  // encryption_key_version
+                None,  // transfer_task_id
             )
             .unwrap();
 
@@ -1848,6 +1882,7 @@ mod tests {
                 None,
                 None,  // is_encrypted
                 None,  // encryption_key_version
+                None
             )
             .unwrap();
 
@@ -1890,6 +1925,7 @@ mod tests {
                 None,
                 None,  // is_encrypted
                 None,  // encryption_key_version
+                None
             )
             .unwrap();
 
@@ -1943,6 +1979,7 @@ mod tests {
                 None,
                 None,  // is_encrypted
                 None,  // encryption_key_version
+                None
             )
             .unwrap();
 
