@@ -74,6 +74,49 @@
               </el-form-item>
             </el-card>
 
+            <!-- 网络代理配置 -->
+            <el-card class="setting-card" shadow="hover">
+              <template #header>
+                <div class="card-header">
+                  <el-icon :size="20" color="#409eff">
+                    <Connection />
+                  </el-icon>
+                  <span>网络代理</span>
+                </div>
+              </template>
+
+              <el-form-item label="代理类型" prop="network.proxy.proxy_type">
+                <el-radio-group v-model="formData.network.proxy.proxy_type">
+                  <el-radio value="none">不使用代理</el-radio>
+                  <el-radio value="http">HTTP 代理</el-radio>
+                  <el-radio value="socks5">SOCKS5 代理</el-radio>
+                </el-radio-group>
+                <div class="form-tip">支持 Windows / macOS / Linux (arm64) 平台。</div>
+              </el-form-item>
+
+              <el-form-item label="代理服务器" prop="network.proxy.host">
+                <el-input
+                    v-model="formData.network.proxy.host"
+                    placeholder="例如: 127.0.0.1 或 proxy.example.com"
+                    clearable
+                    :disabled="formData.network.proxy.proxy_type === 'none'"
+                />
+              </el-form-item>
+
+              <el-form-item label="代理端口" prop="network.proxy.port">
+                <el-input-number
+                    v-model="formData.network.proxy.port"
+                    :min="1"
+                    :max="65535"
+                    :step="1"
+                    controls-position="right"
+                    :disabled="formData.network.proxy.proxy_type === 'none'"
+                    style="width: 100%"
+                />
+                <div class="form-tip">代理配置保存后，新建网络连接会使用代理；建议重启服务或重新登录后生效更彻底。</div>
+              </el-form-item>
+            </el-card>
+
             <!-- Web 访问认证设置 -->
             <AuthSettingsSection />
 
@@ -837,6 +880,52 @@ const rules = reactive<FormRules<AppConfig>>({
   'server.port': [
     { required: true, message: '请输入监听端口', trigger: 'blur' },
     { type: 'number', min: 1, max: 65535, message: '端口范围: 1-65535', trigger: 'blur' },
+  ],
+  'network.proxy.host': [
+    {
+      validator: (_rule: any, value: any, callback: any) => {
+        if (!formData.value) {
+          callback()
+          return
+        }
+
+        if (formData.value.network.proxy.proxy_type === 'none') {
+          callback()
+          return
+        }
+
+        if (!value || !String(value).trim()) {
+          callback(new Error('启用代理时，请输入代理服务器地址'))
+          return
+        }
+
+        callback()
+      },
+      trigger: 'blur'
+    }
+  ],
+  'network.proxy.port': [
+    {
+      validator: (_rule: any, value: any, callback: any) => {
+        if (!formData.value) {
+          callback()
+          return
+        }
+
+        if (formData.value.network.proxy.proxy_type === 'none') {
+          callback()
+          return
+        }
+
+        if (typeof value !== 'number' || value < 1 || value > 65535) {
+          callback(new Error('启用代理时，端口范围必须是 1-65535'))
+          return
+        }
+
+        callback()
+      },
+      trigger: 'change'
+    }
   ],
   'download.download_dir': [
     { required: true, message: '请输入下载目录', trigger: 'blur' },

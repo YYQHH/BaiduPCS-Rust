@@ -1,12 +1,12 @@
 // 应用状态
 
 use crate::auth::{QRCodeAuth, SessionManager, UserAuth};
-use crate::encryption::SnapshotManager;
 use crate::autobackup::record::BackupRecordManager;
 use crate::autobackup::AutoBackupManager;
 use crate::common::{MemoryMonitor, MemoryMonitorConfig};
 use crate::config::AppConfig;
 use crate::downloader::{DownloadManager, FolderDownloadManager};
+use crate::encryption::SnapshotManager;
 use crate::netdisk::{CloudDlMonitor, NetdiskClient};
 use crate::persistence::{
     cleanup_completed_tasks, cleanup_invalid_tasks, scan_recoverable_tasks, DownloadRecoveryInfo,
@@ -88,7 +88,7 @@ impl AppState {
         info!("内存监控器已创建");
 
         Ok(Self {
-            qrcode_auth: Arc::new(QRCodeAuth::new()?),
+            qrcode_auth: Arc::new(QRCodeAuth::new_with_proxy(&config.network.proxy)?),
             session_manager: Arc::new(Mutex::new(SessionManager::default())),
             current_user: Arc::new(RwLock::new(None)),
             netdisk_client: Arc::new(RwLock::new(None)),
@@ -117,7 +117,8 @@ impl AppState {
             *self.current_user.write().await = Some(user_auth.clone());
 
             // 初始化网盘客户端
-            let client = NetdiskClient::new(user_auth.clone())?;
+            let proxy_config = self.config.read().await.network.proxy.clone();
+            let client = NetdiskClient::new_with_proxy(user_auth.clone(), &proxy_config)?;
 
             // 预热过期时间（2小时 = 7200秒）
             const WARMUP_EXPIRE_SECS: i64 = 86400;
@@ -135,20 +136,14 @@ impl AppState {
                 let now = chrono::Utc::now().timestamp();
                 let elapsed = now - last_warmup;
                 if elapsed > WARMUP_EXPIRE_SECS {
-                    info!(
-                        "防止预热数据过期({}秒前),清除旧数据并重新预热...",
-                        elapsed
-                    );
+                    info!("防止预热数据过期({}秒前),清除旧数据并重新预热...", elapsed);
                     // 清除过期的预热数据
                     user_auth.panpsc = None;
                     user_auth.csrf_token = None;
                     user_auth.bdstoken = None;
                     true
                 } else {
-                    info!(
-                        "检测到已有预热 Cookie({}秒前预热),跳过预热",
-                        elapsed
-                    );
+                    info!("检测到已有预热 Cookie({}秒前预热),跳过预热", elapsed);
                     false
                 }
             } else {
@@ -196,14 +191,16 @@ impl AppState {
             let max_global_threads = config.download.max_global_threads;
             let max_concurrent_tasks = config.download.max_concurrent_tasks;
             let max_retries = config.download.max_retries;
+            let proxy_config = config.network.proxy.clone();
             drop(config);
 
-            let mut manager = DownloadManager::with_config(
+            let mut manager = DownloadManager::with_config_and_proxy(
                 user_auth.clone(),
                 download_dir,
                 max_global_threads,
                 max_concurrent_tasks,
                 max_retries,
+                proxy_config,
             )?;
 
             // 🔥 设置持久化管理器
@@ -250,8 +247,12 @@ impl AppState {
 
             // 🔥 配置目录（用于读取 encryption.json）
             let config_dir = std::path::Path::new("config");
-            let upload_manager =
-                UploadManager::new_with_config(client.clone(), &user_auth, &upload_config, config_dir);
+            let upload_manager = UploadManager::new_with_config(
+                client.clone(),
+                &user_auth,
+                &upload_config,
+                config_dir,
+            );
             let upload_manager_arc = Arc::new(upload_manager);
 
             // 🔥 设置持久化管理器
@@ -309,10 +310,12 @@ impl AppState {
                 &transfer_manager_arc,
                 &pm_arc,
             )
-                .await;
+            .await;
 
             // 🔥 启动时清理孤立临时目录（如果配置启用）
-            transfer_manager_arc.cleanup_orphaned_on_startup_if_enabled().await;
+            transfer_manager_arc
+                .cleanup_orphaned_on_startup_if_enabled()
+                .await;
         }
 
         // 🔥 启动 WebSocket 批量发送器
@@ -369,11 +372,18 @@ impl AppState {
                 }
 
                 // 🔥 先恢复文件夹任务（必须在恢复子任务之前）
-                let (restored_folders, skipped_folders) = self.folder_download_manager.restore_folders().await;
-                info!("文件夹任务恢复完成: 恢复 {} 个, 跳过 {} 个", restored_folders, skipped_folders);
+                let (restored_folders, skipped_folders) =
+                    self.folder_download_manager.restore_folders().await;
+                info!(
+                    "文件夹任务恢复完成: 恢复 {} 个, 跳过 {} 个",
+                    restored_folders, skipped_folders
+                );
 
                 // 🔥 加载历史归档的已完成文件夹到内存（用于前端显示历史记录）
-                let history_folders = self.folder_download_manager.load_history_folders_to_memory().await;
+                let history_folders = self
+                    .folder_download_manager
+                    .load_history_folders_to_memory()
+                    .await;
                 if history_folders > 0 {
                     info!("历史文件夹加载完成: {} 个", history_folders);
                 }
@@ -390,7 +400,9 @@ impl AppState {
                     info!("下载任务恢复完成: {} 成功, {} 失败", success, failed);
 
                     // 🔥 同步恢复的子任务进度到文件夹
-                    self.folder_download_manager.sync_restored_tasks_progress().await;
+                    self.folder_download_manager
+                        .sync_restored_tasks_progress()
+                        .await;
                 }
 
                 // 🔥 恢复模式补任务：从 pending_files 创建暂停状态的任务
@@ -451,7 +463,9 @@ impl AppState {
             temp_dir,
             Arc::clone(&self.backup_record_manager),
             Arc::clone(&self.snapshot_manager),
-        ).await {
+        )
+        .await
+        {
             Ok(manager) => {
                 // 设置 WebSocket 管理器
                 manager.set_ws_manager(Arc::clone(&self.ws_manager));
@@ -472,21 +486,29 @@ impl AppState {
 
                 // 注入到下载管理器（用于解密时查询原始文件名和 key_version）
                 if let Some(ref download_mgr) = *self.download_manager.read().await {
-                    download_mgr.set_snapshot_manager(Arc::clone(&self.snapshot_manager)).await;
-                    download_mgr.set_encryption_config_store(Arc::clone(&encryption_config_store)).await;
+                    download_mgr
+                        .set_snapshot_manager(Arc::clone(&self.snapshot_manager))
+                        .await;
+                    download_mgr
+                        .set_encryption_config_store(Arc::clone(&encryption_config_store))
+                        .await;
                     info!("已将 snapshot_manager 和 encryption_config_store 注入到下载管理器");
                 }
 
                 // 注入到上传管理器（用于上传完成后保存加密映射）
                 if let Some(ref upload_mgr) = *self.upload_manager.read().await {
-                    upload_mgr.set_snapshot_manager(Arc::clone(&self.snapshot_manager)).await;
+                    upload_mgr
+                        .set_snapshot_manager(Arc::clone(&self.snapshot_manager))
+                        .await;
                     info!("已将 snapshot_manager 注入到上传管理器");
                 }
 
                 let manager_arc = Arc::new(manager);
 
                 // 🔥 初始化全局轮询（使用配置文件中的触发配置）
-                manager_arc.update_trigger_config(upload_trigger, download_trigger).await;
+                manager_arc
+                    .update_trigger_config(upload_trigger, download_trigger)
+                    .await;
 
                 // 启动事件消费循环（监听文件变更和定时轮询事件）
                 manager_arc.start_event_consumer().await;
@@ -534,7 +556,9 @@ impl AppState {
         }
 
         // 🔥 设置文件夹下载管理器（用于自动下载文件夹）
-        monitor.set_folder_download_manager(Arc::clone(&self.folder_download_manager)).await;
+        monitor
+            .set_folder_download_manager(Arc::clone(&self.folder_download_manager))
+            .await;
 
         // 从数据库加载未触发的自动下载配置
         let loaded = monitor.load_auto_download_configs_from_db().await;

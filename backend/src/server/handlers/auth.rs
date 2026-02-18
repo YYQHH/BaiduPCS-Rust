@@ -150,7 +150,11 @@ pub async fn qrcode_status(
                 *state.current_user.write().await = Some(user.clone());
 
                 // 初始化网盘客户端
-                let client = match crate::netdisk::NetdiskClient::new(user.clone()) {
+                let proxy_config = state.config.read().await.network.proxy.clone();
+                let client = match crate::netdisk::NetdiskClient::new_with_proxy(
+                    user.clone(),
+                    &proxy_config,
+                ) {
                     Ok(c) => c,
                     Err(e) => {
                         error!("初始化网盘客户端失败: {}", e);
@@ -194,17 +198,20 @@ pub async fn qrcode_status(
                 let max_retries = config.download.max_retries;
                 let upload_config = config.upload.clone();
                 let transfer_config = config.transfer.clone();
-                drop(config);
 
                 // 获取持久化管理器引用
                 let pm_arc = Arc::clone(&state.persistence_manager);
 
-                match crate::downloader::DownloadManager::with_config(
+                let proxy_config = config.network.proxy.clone();
+                drop(config);
+
+                match crate::downloader::DownloadManager::with_config_and_proxy(
                     updated_user.clone(),
                     download_dir,
                     max_global_threads,
                     max_concurrent_tasks,
                     max_retries,
+                    proxy_config,
                 ) {
                     Ok(mut manager) => {
                         // 设置持久化管理器
@@ -251,8 +258,12 @@ pub async fn qrcode_status(
 
                         // 初始化上传管理器（使用配置参数）
                         let config_dir = std::path::Path::new("config");
-                        let upload_manager =
-                            UploadManager::new_with_config(client.clone(), &updated_user, &upload_config, config_dir);
+                        let upload_manager = UploadManager::new_with_config(
+                            client.clone(),
+                            &updated_user,
+                            &upload_config,
+                            config_dir,
+                        );
                         let upload_manager_arc = Arc::new(upload_manager);
 
                         // 设置上传管理器的持久化管理器
@@ -301,7 +312,8 @@ pub async fn qrcode_status(
                             .set_ws_manager(Arc::clone(&state.ws_manager))
                             .await;
 
-                        *state.transfer_manager.write().await = Some(Arc::clone(&transfer_manager_arc));
+                        *state.transfer_manager.write().await =
+                            Some(Arc::clone(&transfer_manager_arc));
                         info!("✅ 转存管理器初始化成功");
 
                         // 启动 WebSocket 批量发送器
