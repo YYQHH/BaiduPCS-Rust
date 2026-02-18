@@ -113,6 +113,24 @@
                     :disabled="formData.network.proxy.proxy_type === 'none'"
                     style="width: 100%"
                 />
+              </el-form-item>
+
+              <el-form-item label="代理用户名" prop="network.proxy.username">
+                <el-input
+                    v-model="formData.network.proxy.username"
+                    placeholder="可选，例如: my_user"
+                    clearable
+                    :disabled="formData.network.proxy.proxy_type === 'none'"
+                />
+              </el-form-item>
+
+              <el-form-item label="代理密码" prop="network.proxy.password">
+                <el-input
+                    v-model="formData.network.proxy.password"
+                    placeholder="可选，留空表示无认证"
+                    show-password
+                    :disabled="formData.network.proxy.proxy_type === 'none'"
+                />
                 <div class="form-tip">代理配置保存后，新建网络连接会使用代理；建议重启服务或重新登录后生效更彻底。</div>
               </el-form-item>
             </el-card>

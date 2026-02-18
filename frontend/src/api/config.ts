@@ -80,6 +80,8 @@ export interface ProxyConfig {
   proxy_type: ProxyType
   host: string
   port: number
+  username: string
+  password: string
 }
 
 export interface NetworkConfig {
