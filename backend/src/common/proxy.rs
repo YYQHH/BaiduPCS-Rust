@@ -32,6 +32,12 @@ pub struct ProxyConfig {
     /// 代理端口
     #[serde(default)]
     pub port: u16,
+    /// 代理认证用户名（可选）
+    #[serde(default)]
+    pub username: String,
+    /// 代理认证密码（可选）
+    #[serde(default)]
+    pub password: String,
 }
 
 impl ProxyConfig {
@@ -55,13 +61,20 @@ impl ProxyConfig {
             anyhow::bail!("代理已启用，但代理端口必须在 1-65535 范围内");
         }
 
+        let host = normalize_proxy_host(host);
         let proxy_url = match self.proxy_type {
             ProxyType::None => return Ok(None),
             ProxyType::Http => format!("http://{host}:{}", self.port),
             ProxyType::Socks5 => format!("socks5h://{host}:{}", self.port),
         };
 
-        let proxy = Proxy::all(&proxy_url).with_context(|| format!("创建代理失败: {proxy_url}"))?;
+        let mut proxy =
+            Proxy::all(&proxy_url).with_context(|| format!("创建代理失败: {proxy_url}"))?;
+
+        let username = self.username.trim();
+        if !username.is_empty() {
+            proxy = proxy.basic_auth(username, self.password.trim());
+        }
 
         Ok(Some(proxy))
     }
@@ -71,7 +84,26 @@ impl ProxyConfig {
         if let Some(proxy) = self.to_reqwest_proxy()? {
             Ok(builder.proxy(proxy))
         } else {
-            Ok(builder)
+            Ok(builder.no_proxy())
         }
+    }
+}
+
+fn normalize_proxy_host(host: &str) -> String {
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_proxy_host;
+
+    #[test]
+    fn normalize_ipv6_host() {
+        assert_eq!(normalize_proxy_host("::1"), "[::1]");
+        assert_eq!(normalize_proxy_host("[::1]"), "[::1]");
     }
 }

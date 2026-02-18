@@ -64,3 +64,7 @@ proxy_type = "none"
 host = ""
 # 代理端口
 port = 0
+# 代理认证用户名（可选）
+username = ""
+# 代理认证密码（可选）
+password = ""
