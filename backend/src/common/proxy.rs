@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use reqwest::Url;
 use reqwest::{ClientBuilder, Proxy};
 use serde::{Deserialize, Serialize};
 
@@ -9,8 +10,10 @@ pub enum ProxyType {
     /// 不使用代理
     None,
     /// HTTP 代理
+    #[serde(alias = "https")]
     Http,
     /// SOCKS5 代理
+    #[serde(alias = "socks5h")]
     Socks5,
 }
 
@@ -61,19 +64,25 @@ impl ProxyConfig {
             anyhow::bail!("代理已启用，但代理端口必须在 1-65535 范围内");
         }
 
+        let username = self.username.trim();
+        let password = self.password.trim();
+
         let host = normalize_proxy_host(host);
-        let proxy_url = match self.proxy_type {
-            ProxyType::None => return Ok(None),
-            ProxyType::Http => format!("http://{host}:{}", self.port),
-            ProxyType::Socks5 => format!("socks5h://{host}:{}", self.port),
-        };
+        let proxy_url = build_proxy_url(
+            self.proxy_type.clone(),
+            &host,
+            self.port,
+            username,
+            password,
+        )?;
 
         let mut proxy =
             Proxy::all(&proxy_url).with_context(|| format!("创建代理失败: {proxy_url}"))?;
 
-        let username = self.username.trim();
-        if !username.is_empty() {
-            proxy = proxy.basic_auth(username, self.password.trim());
+        // HTTP 代理鉴权使用 Proxy-Authorization 头。
+        // SOCKS5 用户名/密码已放入 URL，会在 SOCKS5 握手阶段完成鉴权。
+        if self.proxy_type == ProxyType::Http && !username.is_empty() {
+            proxy = proxy.basic_auth(username, password);
         }
 
         Ok(Some(proxy))
@@ -89,6 +98,32 @@ impl ProxyConfig {
     }
 }
 
+fn build_proxy_url(
+    proxy_type: ProxyType,
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+) -> Result<String> {
+    let scheme = match proxy_type {
+        ProxyType::None => return Ok(String::new()),
+        ProxyType::Http => "http",
+        ProxyType::Socks5 => "socks5h",
+    };
+
+    let mut url = Url::parse(&format!("{scheme}://{host}:{port}"))
+        .with_context(|| format!("创建代理 URL 失败: {scheme}://{host}:{port}"))?;
+
+    if proxy_type == ProxyType::Socks5 && !username.is_empty() {
+        url.set_username(username)
+            .map_err(|_| anyhow::anyhow!("SOCKS5 用户名包含非法字符"))?;
+        url.set_password(Some(password))
+            .map_err(|_| anyhow::anyhow!("SOCKS5 密码包含非法字符"))?;
+    }
+
+    Ok(url.to_string())
+}
+
 fn normalize_proxy_host(host: &str) -> String {
     if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
         format!("[{host}]")
@@ -99,11 +134,39 @@ fn normalize_proxy_host(host: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_proxy_host;
+    use super::{build_proxy_url, normalize_proxy_host, ProxyConfig, ProxyType};
 
     #[test]
     fn normalize_ipv6_host() {
         assert_eq!(normalize_proxy_host("::1"), "[::1]");
         assert_eq!(normalize_proxy_host("[::1]"), "[::1]");
+    }
+
+    #[test]
+    fn socks5_proxy_url_contains_auth_in_url() {
+        let url = build_proxy_url(ProxyType::Socks5, "127.0.0.1", 1080, "user", "p@ss")
+            .expect("build socks5 proxy url");
+        assert_eq!(url, "socks5h://user:p%40ss@127.0.0.1:1080");
+    }
+
+    #[test]
+    fn proxy_type_supports_legacy_alias_values() {
+        let http_cfg: ProxyConfig = toml::from_str(
+            r#"proxy_type = "https"
+host = "127.0.0.1"
+port = 8080
+"#,
+        )
+        .expect("parse legacy http proxy_type");
+        assert_eq!(http_cfg.proxy_type, ProxyType::Http);
+
+        let socks_cfg: ProxyConfig = toml::from_str(
+            r#"proxy_type = "socks5h"
+host = "127.0.0.1"
+port = 1080
+"#,
+        )
+        .expect("parse legacy socks5 proxy_type");
+        assert_eq!(socks_cfg.proxy_type, ProxyType::Socks5);
     }
 }
