@@ -1229,14 +1229,6 @@ impl NetdiskClient {
             part_seq, status, response_text
         );
 
-        if !status.is_success() {
-            anyhow::bail!(
-                "上传分片请求失败: status={}, body={}",
-                status,
-                response_text
-            );
-        }
-
         let chunk_response: UploadChunkResponse = serde_json::from_str(&response_text)
             .with_context(|| {
                 format!(
