@@ -861,8 +861,6 @@ impl UploadChunkScheduler {
                         );
                     } else {
                         // 重试耗尽，杀掉整个任务
-                        task_info.cancellation_token.cancel();
-
                         let error_msg = e.to_string();
                         let is_backup = {
                             let mut t = task_info.task.lock().await;
