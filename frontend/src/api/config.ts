@@ -75,9 +75,11 @@ export interface TransferConfig {
 
 
 export type ProxyType = 'none' | 'http' | 'socks5'
+export type ProxyScope = 'default' | 'transfer_only'
 
 export interface ProxyConfig {
   proxy_type: ProxyType
+  scope: ProxyScope
   host: string
   port: number
   username: string

@@ -88,7 +88,7 @@ impl AppState {
         info!("内存监控器已创建");
 
         Ok(Self {
-            qrcode_auth: Arc::new(QRCodeAuth::new_with_proxy(&config.network.proxy)?),
+            qrcode_auth: Arc::new(QRCodeAuth::new_with_proxy(&config.network.proxy.for_api())?),
             session_manager: Arc::new(Mutex::new(SessionManager::default())),
             current_user: Arc::new(RwLock::new(None)),
             netdisk_client: Arc::new(RwLock::new(None)),
@@ -118,7 +118,9 @@ impl AppState {
 
             // 初始化网盘客户端
             let proxy_config = self.config.read().await.network.proxy.clone();
-            let client = NetdiskClient::new_with_proxy(user_auth.clone(), &proxy_config)?;
+            let api_proxy_config = proxy_config.for_api();
+            let transfer_proxy_config = proxy_config.for_transfer();
+            let client = NetdiskClient::new_with_proxy(user_auth.clone(), &api_proxy_config)?;
 
             // 预热过期时间（2小时 = 7200秒）
             const WARMUP_EXPIRE_SECS: i64 = 86400;
@@ -191,7 +193,6 @@ impl AppState {
             let max_global_threads = config.download.max_global_threads;
             let max_concurrent_tasks = config.download.max_concurrent_tasks;
             let max_retries = config.download.max_retries;
-            let proxy_config = config.network.proxy.clone();
             drop(config);
 
             let mut manager = DownloadManager::with_config_and_proxy(
@@ -200,7 +201,7 @@ impl AppState {
                 max_global_threads,
                 max_concurrent_tasks,
                 max_retries,
-                proxy_config,
+                transfer_proxy_config.clone(),
             )?;
 
             // 🔥 设置持久化管理器
@@ -247,8 +248,10 @@ impl AppState {
 
             // 🔥 配置目录（用于读取 encryption.json）
             let config_dir = std::path::Path::new("config");
+            let transfer_client =
+                NetdiskClient::new_with_proxy(user_auth.clone(), &transfer_proxy_config)?;
             let upload_manager = UploadManager::new_with_config(
-                client.clone(),
+                transfer_client,
                 &user_auth,
                 &upload_config,
                 config_dir,
