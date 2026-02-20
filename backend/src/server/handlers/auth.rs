@@ -151,9 +151,11 @@ pub async fn qrcode_status(
 
                 // 初始化网盘客户端
                 let proxy_config = state.config.read().await.network.proxy.clone();
+                let api_proxy_config = proxy_config.for_api();
+                let transfer_proxy_config = proxy_config.for_transfer();
                 let client = match crate::netdisk::NetdiskClient::new_with_proxy(
                     user.clone(),
-                    &proxy_config,
+                    &api_proxy_config,
                 ) {
                     Ok(c) => c,
                     Err(e) => {
@@ -202,7 +204,6 @@ pub async fn qrcode_status(
                 // 获取持久化管理器引用
                 let pm_arc = Arc::clone(&state.persistence_manager);
 
-                let proxy_config = config.network.proxy.clone();
                 drop(config);
 
                 match crate::downloader::DownloadManager::with_config_and_proxy(
@@ -211,7 +212,7 @@ pub async fn qrcode_status(
                     max_global_threads,
                     max_concurrent_tasks,
                     max_retries,
-                    proxy_config,
+                    transfer_proxy_config.clone(),
                 ) {
                     Ok(mut manager) => {
                         // 设置持久化管理器
@@ -258,8 +259,18 @@ pub async fn qrcode_status(
 
                         // 初始化上传管理器（使用配置参数）
                         let config_dir = std::path::Path::new("config");
+                        let transfer_client = match crate::netdisk::NetdiskClient::new_with_proxy(
+                            updated_user.clone(),
+                            &transfer_proxy_config,
+                        ) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!("❌ 创建上传客户端失败: {}", e);
+                                return Ok(Json(ApiResponse::success(status)));
+                            }
+                        };
                         let upload_manager = UploadManager::new_with_config(
-                            client.clone(),
+                            transfer_client,
                             &updated_user,
                             &upload_config,
                             config_dir,

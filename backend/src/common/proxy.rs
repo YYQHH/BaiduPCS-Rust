@@ -23,6 +23,22 @@ impl Default for ProxyType {
     }
 }
 
+/// 代理生效范围
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyScope {
+    /// 默认模式：代理作用于所有网络请求（当前行为）
+    Default,
+    /// 仅代理上传/下载相关逻辑
+    TransferOnly,
+}
+
+impl Default for ProxyScope {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
 /// 网络代理配置
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
@@ -41,12 +57,31 @@ pub struct ProxyConfig {
     /// 代理认证密码（可选）
     #[serde(default)]
     pub password: String,
+    /// 代理生效范围
+    #[serde(default)]
+    pub scope: ProxyScope,
 }
 
 impl ProxyConfig {
     /// 是否启用代理
     pub fn is_enabled(&self) -> bool {
         self.proxy_type != ProxyType::None
+    }
+
+    /// 面向 API 类请求（登录、列表、元信息等）的有效代理配置
+    pub fn for_api(&self) -> Self {
+        if self.scope == ProxyScope::TransferOnly {
+            let mut cfg = self.clone();
+            cfg.proxy_type = ProxyType::None;
+            cfg
+        } else {
+            self.clone()
+        }
+    }
+
+    /// 面向上传/下载数据传输链路的有效代理配置
+    pub fn for_transfer(&self) -> Self {
+        self.clone()
     }
 
     /// 构建 reqwest Proxy

@@ -94,6 +94,14 @@
                 <div class="form-tip">支持 Windows / macOS / Linux (arm64) 平台。</div>
               </el-form-item>
 
+
+              <el-form-item label="代理作用范围" prop="network.proxy.scope">
+                <el-radio-group v-model="formData.network.proxy.scope">
+                  <el-radio value="default">默认（当前设置）</el-radio>
+                  <el-radio value="transfer_only">仅代理上传下载相关逻辑</el-radio>
+                </el-radio-group>
+              </el-form-item>
+
               <el-form-item label="代理服务器" prop="network.proxy.host">
                 <el-input
                     v-model="formData.network.proxy.host"
@@ -1000,6 +1008,12 @@ async function loadConfig() {
   try {
     const config = await configStore.fetchConfig()
     formData.value = JSON.parse(JSON.stringify(config)) // 深拷贝
+
+    // 兼容旧配置：未包含 proxy.scope 时，回落到默认模式
+    const form = formData.value
+    if (form && !form.network.proxy.scope) {
+      form.network.proxy.scope = 'default'
+    }
 
     // 同时加载推荐配置
     try {

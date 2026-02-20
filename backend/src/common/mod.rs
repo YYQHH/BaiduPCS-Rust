@@ -9,7 +9,7 @@ mod speed_anomaly_detector;
 mod thread_stagnation_detector;
 
 pub use memory_monitor::{MemoryAnomaly, MemoryMonitor, MemoryMonitorConfig, MemorySample};
-pub use proxy::{ProxyConfig, ProxyType};
+pub use proxy::{ProxyConfig, ProxyScope, ProxyType};
 pub use refresh_coordinator::{RefreshCoordinator, RefreshCoordinatorConfig, RefreshGuard};
 pub use speed_anomaly_detector::{SpeedAnomalyConfig, SpeedAnomalyDetector};
 pub use thread_stagnation_detector::{StagnationConfig, ThreadStagnationDetector};
