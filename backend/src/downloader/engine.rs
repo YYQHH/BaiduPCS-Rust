@@ -1,6 +1,6 @@
 use crate::auth::UserAuth;
 use crate::autobackup::events::{BackupTransferNotification, TransferTaskType};
-use crate::common::ProxyConfig;
+use crate::common::{BandwidthLimiter, ProxyConfig};
 use crate::common::{RefreshCoordinator, RefreshCoordinatorConfig};
 use crate::config::{DownloadConfig, VipType};
 use crate::downloader::{ChunkManager, DownloadTask, SpeedCalculator};
@@ -13,9 +13,10 @@ use futures::future::join_all;
 use reqwest::Client;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
@@ -818,16 +819,26 @@ pub struct DownloadEngine {
     fs_lock: Arc<Mutex<()>>,
     /// 代理配置
     proxy_config: ProxyConfig,
+    /// 全局下载限速器（所有下载任务共享）
+    bandwidth_limiter: Arc<BandwidthLimiter>,
+    /// 下载当前是否优先使用代理（true=代理，false=直连 fallback）
+    proxy_download_mode: Arc<AtomicBool>,
+    /// 上次通过代理探测下载链路时间
+    last_proxy_probe: Arc<Mutex<Instant>>,
 }
 
 impl DownloadEngine {
     /// 创建新的下载引擎
     pub fn new(user_auth: UserAuth) -> Self {
-        Self::new_with_proxy(user_auth, ProxyConfig::default())
+        Self::new_with_proxy(user_auth, ProxyConfig::default(), 0)
     }
 
     /// 创建新的下载引擎（可选代理）
-    pub fn new_with_proxy(user_auth: UserAuth, proxy_config: ProxyConfig) -> Self {
+    pub fn new_with_proxy(
+        user_auth: UserAuth,
+        proxy_config: ProxyConfig,
+        speed_limit_kbps: u64,
+    ) -> Self {
         // 基础HTTP客户端，使用较长的超时时间以支持大分片下载
         // 实际超时会在每个请求中根据分片大小动态调整
         let builder = Client::builder()
@@ -850,7 +861,34 @@ impl DownloadEngine {
             vip_type,
             fs_lock: Arc::new(Mutex::new(())),
             proxy_config,
+            bandwidth_limiter: Arc::new(BandwidthLimiter::new(
+                speed_limit_kbps.saturating_mul(1024),
+            )),
+            proxy_download_mode: Arc::new(AtomicBool::new(true)),
+            last_proxy_probe: Arc::new(Mutex::new(Instant::now())),
         }
+    }
+
+    /// 动态更新下载限速（KB/s，0=不限速）
+    pub async fn update_speed_limit(&self, speed_limit_kbps: u64) {
+        self.bandwidth_limiter.set_rate_kbps(speed_limit_kbps).await;
+    }
+
+    /// 获取下载限速器
+    pub fn bandwidth_limiter(&self) -> Arc<BandwidthLimiter> {
+        self.bandwidth_limiter.clone()
+    }
+
+    pub fn proxy_config(&self) -> ProxyConfig {
+        self.proxy_config.clone()
+    }
+
+    pub fn proxy_download_mode(&self) -> Arc<AtomicBool> {
+        self.proxy_download_mode.clone()
+    }
+
+    pub fn last_proxy_probe(&self) -> Arc<Mutex<Instant>> {
+        self.last_proxy_probe.clone()
     }
 
     /// 创建用于下载的 HTTP 客户端（使用 Android UA 和 Cookie）
@@ -861,7 +899,7 @@ impl DownloadEngine {
     /// - IdleConnTimeout: 90s
     /// - Timeout: 2min
     /// - CheckRedirect: 删除 Referer
-    fn create_download_client(&self) -> Client {
+    pub(crate) fn create_download_client(&self, use_proxy: bool) -> Client {
         // 使用 Android 客户端的 User-Agent（与 NetdiskClient 一致）
         let pan_ua = "netdisk;P2SP;3.0.0.8;netdisk;11.12.3;ANG-AN00;android-android;10.0;JSbridge4.4.0;jointBridge;1.1.0;";
 
@@ -880,9 +918,17 @@ impl DownloadEngine {
             .http2_keep_alive_interval(Some(std::time::Duration::from_secs(10))) // HTTP/2 keep-alive
             .http2_keep_alive_timeout(std::time::Duration::from_secs(20)); // HTTP/2 keep-alive超时
 
-        self.proxy_config
-            .apply_to_builder(builder)
-            .and_then(|b| b.build().context("Failed to build download HTTP client"))
+        let builder = if use_proxy {
+            self.proxy_config
+                .apply_to_builder(builder)
+                .expect("Failed to apply proxy configuration for download client")
+        } else {
+            builder.no_proxy()
+        };
+
+        builder
+            .build()
+            .context("Failed to build download HTTP client")
             .expect("Failed to build download HTTP client")
     }
 
@@ -972,7 +1018,7 @@ impl DownloadEngine {
         info!("获取到 {} 个下载链接", all_urls.len());
 
         // 3. 创建用于下载的专用 HTTP 客户端
-        let download_client = self.create_download_client();
+        let download_client = self.create_download_client(true);
 
         // 4. 🔥 并行探测所有下载链接，过滤出可用的链接
         // 使用分批并行，每批最多 10 个，一般情况下可以一次性并行探测所有链接
@@ -1253,7 +1299,7 @@ impl DownloadEngine {
     ) -> Result<()> {
         // 1. 创建用于下载的专用 HTTP 客户端（所有请求复用同一个 client）
         // ⚠️ 关键：必须复用 client 以保持连接池和 session 一致
-        let download_client = self.create_download_client();
+        let download_client = self.create_download_client(true);
 
         // 2. 探测所有下载链接，过滤出可用的链接
         info!("开始探测 {} 个下载链接...", download_urls.len());
@@ -2341,6 +2387,7 @@ impl DownloadEngine {
 
         // 使用 JoinSet 管理并发任务，支持统一取消
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        let bandwidth_limiter = self.bandwidth_limiter();
 
         for chunk_index in chunks_to_download {
             // 检查任务是否已被取消
@@ -2368,6 +2415,7 @@ impl DownloadEngine {
             let speed_calc = speed_calc.clone();
             let task = task.clone();
             let cancellation_token = cancellation_token.clone();
+            let bandwidth_limiter = bandwidth_limiter.clone();
 
             join_set.spawn(async move {
                 // ✅ 在任务内部获取 permit（不会阻塞循环，实现真正的并发启动）
@@ -2421,6 +2469,7 @@ impl DownloadEngine {
                     None,          // backup_notification_tx（独立模式不需要）
                     None,          // task_slot_pool（独立模式不需要）
                     3,             // max_retries（独立模式使用默认值）
+                    bandwidth_limiter,
                 )
                 .await;
 
@@ -2542,6 +2591,7 @@ impl DownloadEngine {
         backup_notification_tx: Option<mpsc::UnboundedSender<BackupTransferNotification>>,
         task_slot_pool: Option<Arc<crate::task_slot_pool::TaskSlotPool>>,
         max_retries: u32,
+        bandwidth_limiter: Arc<BandwidthLimiter>,
     ) -> Result<()> {
         // 记录尝试过的链接（避免在同一次重试循环中重复尝试同一个链接）
         let mut tried_urls = std::collections::HashSet::new();
@@ -2758,6 +2808,7 @@ impl DownloadEngine {
             match chunk
                 .download(
                     &client,
+                    bandwidth_limiter.clone(),
                     cookie,
                     referer,
                     &current_url,
@@ -2851,7 +2902,7 @@ impl DownloadEngine {
 mod tests {
     use super::*;
     use crate::auth::UserAuth;
-    use crate::common::ProxyConfig;
+    use crate::common::{BandwidthLimiter, ProxyConfig};
 
     fn create_mock_user_auth() -> UserAuth {
         UserAuth {

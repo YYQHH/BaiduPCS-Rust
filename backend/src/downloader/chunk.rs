@@ -1,7 +1,8 @@
+use crate::common::BandwidthLimiter;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use reqwest::Client;
-use std::{ops::Range, path::Path};
+use std::{ops::Range, path::Path, sync::Arc};
 use tokio::{
     fs::File,
     io::{AsyncSeekExt, AsyncWriteExt},
@@ -51,6 +52,7 @@ impl Chunk {
     pub async fn download<F>(
         &mut self,
         client: &Client,
+        bandwidth_limiter: Arc<BandwidthLimiter>,
         cookie: &str,
         referer: Option<&str>,
         url: &str,
@@ -120,17 +122,17 @@ impl Chunk {
         let mut total_bytes_downloaded = 0u64;
         let mut pending_progress = 0u64; // 累积的待更新字节数
         const PROGRESS_UPDATE_THRESHOLD: u64 = 256 * 1024; // 每256KB更新一次进度（减少锁竞争）
-        // 🔥 读取超时：防止CDN连接挂起导致分片线程永久卡死
-        // 当服务端返回headers后数据流停止时，reqwest的全局timeout不会生效，
-        // 需要对每次stream.next()单独设置超时
-        // 使用动态值（由 engine 根据链接速度计算），慢链接获得更长超时
+                                                           // 🔥 读取超时：防止CDN连接挂起导致分片线程永久卡死
+                                                           // 当服务端返回headers后数据流停止时，reqwest的全局timeout不会生效，
+                                                           // 需要对每次stream.next()单独设置超时
+                                                           // 使用动态值（由 engine 根据链接速度计算），慢链接获得更长超时
 
         loop {
             let chunk_result = match tokio::time::timeout(
                 std::time::Duration::from_secs(read_timeout_secs),
                 stream.next(),
             )
-                .await
+            .await
             {
                 Ok(Some(result)) => result,
                 Ok(None) => break, // 流结束
@@ -139,14 +141,14 @@ impl Chunk {
                         "[分片线程{}] 分片 #{} 读取超时({}秒无数据)，已下载 {} bytes",
                         chunk_thread_id, self.index, read_timeout_secs, total_bytes_downloaded
                     );
-                    anyhow::bail!(
-                        "读取数据流超时: {}秒内无数据到达",
-                        read_timeout_secs
-                    );
+                    anyhow::bail!("读取数据流超时: {}秒内无数据到达", read_timeout_secs);
                 }
             };
             let chunk_data = chunk_result.context("读取数据流失败")?;
             let chunk_len = chunk_data.len() as u64;
+
+            // 流式限速：按每次网络读取到的数据块进行节流，抑制短时峰值
+            bandwidth_limiter.acquire(chunk_len).await;
 
             // 写入文件
             file.write_all(&chunk_data).await.context("写入文件失败")?;

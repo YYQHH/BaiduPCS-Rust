@@ -30,6 +30,12 @@ pub struct ConfigUpdateResponse {
 fn validate_proxy_config(config: &AppConfig) -> ApiResult<()> {
     let proxy = &config.network.proxy;
 
+    if !(10..=60).contains(&proxy.fallback_probe_interval_secs) {
+        return Err(ApiError::BadRequest(
+            "临时fallback探测间隔必须在 10-60 秒范围内".to_string(),
+        ));
+    }
+
     if !proxy.is_enabled() {
         return Ok(());
     }
@@ -229,6 +235,9 @@ pub async fn update_config(
         manager
             .update_max_concurrent_tasks(new_config.download.max_concurrent_tasks)
             .await;
+        manager
+            .update_speed_limit(new_config.download.speed_limit_kbps)
+            .await;
         // 更新下载目录
         manager
             .update_download_dir(new_config.download.download_dir.clone())
@@ -262,6 +271,9 @@ pub async fn update_config(
             .update_max_concurrent_tasks(new_config.upload.max_concurrent_tasks)
             .await;
         upload_manager.update_max_retries(new_config.upload.max_retries);
+        upload_manager
+            .update_speed_limit(new_config.upload.speed_limit_kbps)
+            .await;
         info!(
             "✓ 上传管理器配置已动态更新: 线程数={}, 最大任务数={}, 最大重试={}",
             new_config.upload.max_global_threads,

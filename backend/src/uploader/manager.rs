@@ -183,6 +183,7 @@ impl UploadManager {
                 max_global_threads,
                 max_concurrent_tasks,
                 max_retries as u32,
+                config.speed_limit_kbps,
             )))
         } else {
             info!(
@@ -280,6 +281,14 @@ impl UploadManager {
             scheduler.update_max_retries(new_max);
         }
         info!("🔧 上传管理器: 动态调整最大重试次数为 {}", new_max);
+    }
+
+    /// 动态更新上传限速（KB/s，0=不限速）
+    pub async fn update_speed_limit(&self, speed_limit_kbps: u64) {
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.update_speed_limit(speed_limit_kbps).await;
+        }
+        info!("🔧 上传管理器: 动态调整上传限速为 {} KB/s", speed_limit_kbps);
     }
 
     /// 🔥 设置 WebSocket 管理器
