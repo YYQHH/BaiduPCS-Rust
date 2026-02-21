@@ -54,6 +54,7 @@ export interface DownloadConfig {
   chunk_size_mb: number            // 分片大小
   max_concurrent_tasks: number     // 最大同时下载数
   max_retries: number              // 最大重试次数
+  speed_limit_kbps: number         // 下载限速(KB/s), 0=不限速
 }
 
 /// 上传配置
@@ -62,6 +63,7 @@ export interface UploadConfig {
   chunk_size_mb: number            // 分片大小(4-32MB)
   max_concurrent_tasks: number     // 最大同时上传数
   max_retries: number              // 最大重试次数
+  speed_limit_kbps: number         // 上传限速(KB/s), 0=不限速
   skip_hidden_files: boolean       // 上传文件夹时是否跳过隐藏文件
   recent_directory?: string        // 最近使用的上传源目录
 }
@@ -84,6 +86,8 @@ export interface ProxyConfig {
   port: number
   username: string
   password: string
+  allow_temporary_fallback: boolean
+  fallback_probe_interval_secs: number
 }
 
 export interface NetworkConfig {

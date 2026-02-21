@@ -39,8 +39,12 @@ impl Default for ProxyScope {
     }
 }
 
+fn default_fallback_probe_interval_secs() -> u64 {
+    20
+}
+
 /// 网络代理配置
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     /// 代理类型
     #[serde(default)]
@@ -60,6 +64,27 @@ pub struct ProxyConfig {
     /// 代理生效范围
     #[serde(default)]
     pub scope: ProxyScope,
+    /// 允许临时 fallback：当代理上传失败时，临时直连上传并周期性探测代理恢复
+    #[serde(default)]
+    pub allow_temporary_fallback: bool,
+    /// fallback 状态下通过代理重试探测的间隔（秒）
+    #[serde(default = "default_fallback_probe_interval_secs")]
+    pub fallback_probe_interval_secs: u64,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            proxy_type: ProxyType::None,
+            host: String::new(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            scope: ProxyScope::Default,
+            allow_temporary_fallback: false,
+            fallback_probe_interval_secs: default_fallback_probe_interval_secs(),
+        }
+    }
 }
 
 impl ProxyConfig {

@@ -1,5 +1,7 @@
 use crate::encryption::service::EncryptionService;
 use crate::autobackup::events::{BackupTransferNotification, TransferTaskType};
+use crate::common::{BandwidthLimiter, ProxyConfig};
+use std::time::Instant;
 use crate::downloader::{
     ChunkManager, DownloadEngine, DownloadTask, SpeedCalculator, UrlHealthManager,
 };
@@ -88,8 +90,10 @@ pub struct TaskScheduleInfo {
     pub speed_calc: Arc<Mutex<SpeedCalculator>>,
 
     // 下载所需的配置
-    /// HTTP 客户端
+    /// HTTP 客户端（代理路径）
     pub client: Client,
+    /// HTTP 客户端（直连路径）
+    pub direct_client: Client,
     /// Cookie
     pub cookie: String,
     /// Referer 头
@@ -162,6 +166,14 @@ pub struct TaskScheduleInfo {
     // 🔥 链接级重试次数（单次调度内换链接重试的上限）
     /// 从配置 DownloadConfig.max_retries 读取
     pub max_retries: u32,
+    /// 全局下载限速器（所有任务共享）
+    pub bandwidth_limiter: Arc<BandwidthLimiter>,
+    /// 传输代理配置（用于临时 fallback）
+    pub proxy_config: ProxyConfig,
+    /// 下载当前是否优先使用代理（true=代理，false=直连 fallback）
+    pub proxy_download_mode: Arc<std::sync::atomic::AtomicBool>,
+    /// 上次通过代理探测下载链路时间
+    pub last_proxy_probe: Arc<tokio::sync::Mutex<Instant>>,
 }
 
 /// 全局分片调度器
@@ -629,10 +641,70 @@ impl ChunkScheduler {
                 slot_id, chunk_index
             );
 
+            let use_fallback = task_info.proxy_config.is_enabled()
+                && task_info.proxy_config.allow_temporary_fallback;
+
+            // fallback 模式下按间隔探测代理恢复
+            if use_fallback
+                && !task_info
+                    .proxy_download_mode
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let interval = task_info.proxy_config.fallback_probe_interval_secs.clamp(10, 60);
+                let should_probe = {
+                    let mut last = task_info.last_proxy_probe.lock().await;
+                    if last.elapsed().as_secs() >= interval {
+                        *last = Instant::now();
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                if should_probe {
+                    let probe_url = {
+                        let health = task_info.url_health.lock().await;
+                        health.get_url(0).cloned()
+                    };
+                    if let Some(url) = probe_url {
+                        let probe_result = task_info
+                            .client
+                            .head(&url)
+                            .header("Cookie", &task_info.cookie)
+                            .timeout(std::time::Duration::from_secs(4))
+                            .send()
+                            .await;
+                        if probe_result
+                            .as_ref()
+                            .map(|resp| resp.status().is_success() || resp.status().as_u16() == 206)
+                            .unwrap_or(false)
+                        {
+                            task_info
+                                .proxy_download_mode
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            info!(
+                                "[分片线程{}] 代理下载探测恢复成功，切回代理下载",
+                                slot_id
+                            );
+                        }
+                    }
+                }
+            }
+
+            let preferred_client = if use_fallback
+                && !task_info
+                    .proxy_download_mode
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                task_info.direct_client.clone()
+            } else {
+                task_info.client.clone()
+            };
+
             // 调用 DownloadEngine 的下载方法（传入事件总线和节流器）
             let result = DownloadEngine::download_chunk_with_retry(
                 chunk_index,
-                task_info.client.clone(),
+                preferred_client,
                 &task_info.cookie,
                 task_info.referer.as_deref(),
                 task_info.url_health.clone(),
@@ -651,6 +723,7 @@ impl ChunkScheduler {
                 task_info.backup_notification_tx.clone(), // 🔥 备份任务统一通知发送器
                 task_info.task_slot_pool.clone(), // 🔥 任务槽池（用于刷新槽位时间戳）
                 task_info.max_retries, // 🔥 链接级重试次数（从配置读取）
+                task_info.bandwidth_limiter.clone(),
             )
                 .await;
 
@@ -691,6 +764,20 @@ impl ChunkScheduler {
                             "[分片线程{}] 分片 #{} 下载失败: {}",
                             slot_id, chunk_index, e
                         );
+
+                        if use_fallback
+                            && task_info
+                                .proxy_download_mode
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            warn!(
+                                "[分片线程{}] 代理下载失败，临时切换直连 fallback",
+                                slot_id
+                            );
+                            task_info
+                                .proxy_download_mode
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
 
                         // 取消下载标记 + 递增分片调度级重试计数
                         let chunk_retries = {

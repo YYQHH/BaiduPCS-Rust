@@ -91,15 +91,42 @@
                   <el-radio value="http">HTTP 代理</el-radio>
                   <el-radio value="socks5">SOCKS5 代理</el-radio>
                 </el-radio-group>
-                <div class="form-tip">支持 Windows / macOS / Linux (arm64) 平台。</div>
               </el-form-item>
 
 
               <el-form-item label="代理作用范围" prop="network.proxy.scope">
-                <el-radio-group v-model="formData.network.proxy.scope">
+                <el-radio-group v-model="formData.network.proxy.scope" :disabled="!isProxyEnabled">
                   <el-radio value="default">默认（当前设置）</el-radio>
                   <el-radio value="transfer_only">仅代理上传下载相关逻辑</el-radio>
                 </el-radio-group>
+              </el-form-item>
+
+              <el-form-item label="允许临时fallback" prop="network.proxy.allow_temporary_fallback">
+                <el-switch
+                    v-model="formData.network.proxy.allow_temporary_fallback"
+                    :disabled="!isProxyEnabled"
+                    active-text="允许"
+                    inactive-text="关闭"
+                />
+                <div class="form-tip">
+                  当上传分片经代理失败或上传服务器无响应时，临时切换为直连上传；后台会按间隔通过代理探测恢复后自动切回代理。
+                </div>
+              </el-form-item>
+
+              <el-form-item
+                  v-if="isProxyEnabled && formData.network.proxy.allow_temporary_fallback"
+                  label="fallback探测间隔(秒)"
+                  prop="network.proxy.fallback_probe_interval_secs"
+              >
+                <el-input-number
+                    v-model="formData.network.proxy.fallback_probe_interval_secs"
+                    :min="10"
+                    :max="60"
+                    :step="1"
+                    controls-position="right"
+                    style="width: 100%"
+                />
+                <div class="form-tip">每隔 N 秒通过代理测试上传服务器可用性，恢复后自动切回代理。</div>
               </el-form-item>
 
               <el-form-item label="代理服务器" prop="network.proxy.host">
@@ -257,6 +284,7 @@
                   <el-icon><InfoFilled /></el-icon>
                   所有下载任务共享的线程池大小，单文件可使用全部线程进行分片下载
                 </div>
+                <div class="form-tip">如网络环境较差，请酌情考虑降低线程数</div>
                 <div class="form-tip warning-tip" v-if="formData.download.max_global_threads > 10 && recommended && recommended.vip_type === 0">
                   ⚠️ 警告：普通用户建议保持1个线程，调大可能触发限速！
                 </div>
@@ -281,6 +309,7 @@
                 <div class="form-tip">
                   可以同时进行下载的文件数量上限
                 </div>
+                <div class="form-tip">如网络环境较差，请酌情考虑降低线程数</div>
               </el-form-item>
 
               <!-- 分片大小说明（自适应，不可配置） -->
@@ -302,6 +331,21 @@
                   </div>
                 </template>
               </el-alert>
+
+
+              <el-form-item label="下载限速 (KB/s)" prop="download.speed_limit_kbps">
+                <el-input-number
+                    v-model="formData.download.speed_limit_kbps"
+                    :min="0"
+                    :max="1024 * 1024"
+                    :step="100"
+                    controls-position="right"
+                    style="width: 100%"
+                    placeholder="0 或留空为不限速"
+                />
+                <div class="form-tip">输入目标限速值（KB/s），0 表示不限制总下载速度（多线程总和）</div>
+                <div class="form-tip">如限速过慢，可能出现分片传输失败</div>
+              </el-form-item>
 
               <el-form-item label="最大重试次数" prop="download.max_retries">
                 <el-input-number
@@ -344,6 +388,7 @@
                   <el-icon><InfoFilled /></el-icon>
                   所有上传任务共享的线程池大小
                 </div>
+                <div class="form-tip">如网络环境较差，请酌情考虑降低线程数</div>
               </el-form-item>
 
               <el-form-item label="最大同时上传数" prop="upload.max_concurrent_tasks">
@@ -362,6 +407,22 @@
                 <div class="form-tip">
                   可以同时进行上传的文件数量上限
                 </div>
+                <div class="form-tip">如网络环境较差，请酌情考虑降低线程数</div>
+              </el-form-item>
+
+
+              <el-form-item label="上传限速 (KB/s)" prop="upload.speed_limit_kbps">
+                <el-input-number
+                    v-model="formData.upload.speed_limit_kbps"
+                    :min="0"
+                    :max="1024 * 1024"
+                    :step="100"
+                    controls-position="right"
+                    style="width: 100%"
+                    placeholder="0 或留空为不限速"
+                />
+                <div class="form-tip">输入目标限速值（KB/s），0 表示不限制总上传速度（多线程总和）</div>
+                <div class="form-tip">如限速过慢，可能出现分片传输失败</div>
               </el-form-item>
 
               <el-form-item label="最大重试次数" prop="upload.max_retries">
@@ -784,7 +845,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, computed } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { useIsMobile } from '@/utils/responsive'
 import { useConfigStore } from '@/stores/config'
@@ -846,6 +907,8 @@ const formData = ref<AppConfig | null>(null)
 const recommended = ref<any>(null)
 const transferBehavior = ref('transfer_only')
 const showDirPicker = ref(false)
+
+const isProxyEnabled = computed(() => formData.value?.network.proxy.proxy_type !== 'none')
 
 // 加密相关状态
 const encryptionStatus = ref<EncryptionStatus | null>(null)
@@ -930,6 +993,9 @@ const rules = reactive<FormRules<AppConfig>>({
       trigger: 'blur'
     }
   ],
+  'network.proxy.fallback_probe_interval_secs': [
+    { type: 'number', min: 10, max: 60, message: 'fallback探测间隔范围: 10-60 秒', trigger: 'blur' },
+  ],
   'network.proxy.port': [
     {
       validator: (_rule: any, value: any, callback: any) => {
@@ -988,6 +1054,9 @@ const rules = reactive<FormRules<AppConfig>>({
     { required: true, message: '请输入最大重试次数', trigger: 'blur' },
     { type: 'number', min: 0, max: 10, message: '重试次数范围: 0-10', trigger: 'blur' },
   ],
+  'download.speed_limit_kbps': [
+    { type: 'number', min: 0, max: 1024 * 1024, message: '下载限速范围: 0-1048576 KB/s', trigger: 'blur' },
+  ],
   'upload.max_global_threads': [
     { required: true, message: '请选择上传全局最大线程数', trigger: 'change' },
     { type: 'number', min: 1, max: 20, message: '线程数范围: 1-20', trigger: 'change' },
@@ -999,6 +1068,9 @@ const rules = reactive<FormRules<AppConfig>>({
   'upload.max_retries': [
     { required: true, message: '请输入最大重试次数', trigger: 'blur' },
     { type: 'number', min: 0, max: 10, message: '重试次数范围: 0-10', trigger: 'blur' },
+  ],
+  'upload.speed_limit_kbps': [
+    { type: 'number', min: 0, max: 1024 * 1024, message: '上传限速范围: 0-1048576 KB/s', trigger: 'blur' },
   ],
 })
 
@@ -1013,6 +1085,12 @@ async function loadConfig() {
     const form = formData.value
     if (form && !form.network.proxy.scope) {
       form.network.proxy.scope = 'default'
+    }
+    if (form && form.network.proxy.allow_temporary_fallback === undefined) {
+      form.network.proxy.allow_temporary_fallback = false
+    }
+    if (form && !form.network.proxy.fallback_probe_interval_secs) {
+      form.network.proxy.fallback_probe_interval_secs = 20
     }
 
     // 同时加载推荐配置

@@ -198,6 +198,7 @@ pub async fn qrcode_status(
                 let max_global_threads = config.download.max_global_threads;
                 let max_concurrent_tasks = config.download.max_concurrent_tasks;
                 let max_retries = config.download.max_retries;
+            let speed_limit_kbps = config.download.speed_limit_kbps;
                 let upload_config = config.upload.clone();
                 let transfer_config = config.transfer.clone();
 
@@ -212,6 +213,7 @@ pub async fn qrcode_status(
                     max_global_threads,
                     max_concurrent_tasks,
                     max_retries,
+                    speed_limit_kbps,
                     transfer_proxy_config.clone(),
                 ) {
                     Ok(mut manager) => {

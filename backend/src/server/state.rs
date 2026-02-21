@@ -193,6 +193,7 @@ impl AppState {
             let max_global_threads = config.download.max_global_threads;
             let max_concurrent_tasks = config.download.max_concurrent_tasks;
             let max_retries = config.download.max_retries;
+            let speed_limit_kbps = config.download.speed_limit_kbps;
             drop(config);
 
             let mut manager = DownloadManager::with_config_and_proxy(
@@ -201,6 +202,7 @@ impl AppState {
                 max_global_threads,
                 max_concurrent_tasks,
                 max_retries,
+                speed_limit_kbps,
                 transfer_proxy_config.clone(),
             )?;
 

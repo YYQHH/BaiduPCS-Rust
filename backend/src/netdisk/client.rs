@@ -3,26 +3,32 @@
 use crate::auth::constants::USER_AGENT as WEB_USER_AGENT; // 导入登录时的 UA,确保一致
 use crate::auth::constants::{API_USER_INFO, BAIDU_APP_ID, CLIENT_TYPE, USER_AGENT};
 use crate::auth::UserAuth;
-use crate::common::ProxyConfig;
+use crate::common::{BandwidthLimiter, ProxyConfig};
 use crate::netdisk::{
     CreateFileResponse, FileListResponse, LocateDownloadResponse, PrecreateResponse,
     RapidUploadResponse, UploadChunkResponse, UploadErrorKind,
 };
 use crate::sign::LocateSign;
 use anyhow::{Context, Result};
+use futures::stream;
 use reqwest::cookie::CookieStore;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::multipart;
 use reqwest::Client;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 /// 百度网盘客户端
 #[derive(Debug, Clone)]
 pub struct NetdiskClient {
-    /// HTTP客户端
+    /// HTTP客户端（遵循代理配置）
     client: Client,
+    /// 直连 HTTP 客户端（不走代理，用于临时 fallback）
+    direct_client: Client,
     /// Cookie Jar (用于调试和检查 Cookie 状态)
     cookie_jar: std::sync::Arc<reqwest::cookie::Jar>,
     /// 用户认证信息
@@ -38,6 +44,12 @@ pub struct NetdiskClient {
     panpsc_cookie: std::sync::Arc<Mutex<Option<String>>>,
     /// bdstoken（/api/loginStatus 或 /api/gettemplatevariable 返回）
     bdstoken: std::sync::Arc<Mutex<Option<String>>>,
+    /// 传输代理配置（用于上传临时 fallback）
+    proxy_config: ProxyConfig,
+    /// 上传当前是否优先使用代理（true=代理，false=直连 fallback）
+    proxy_upload_mode: std::sync::Arc<AtomicBool>,
+    /// 上次通过代理探测上传服务器时间
+    last_proxy_probe: std::sync::Arc<Mutex<Instant>>,
 }
 
 impl NetdiskClient {
@@ -108,6 +120,14 @@ impl NetdiskClient {
         let builder = proxy_config.apply_to_builder(builder)?;
         let client = builder.build().context("Failed to create HTTP client")?;
 
+        let direct_client = Client::builder()
+            .cookie_provider(Arc::clone(&jar))
+            .timeout(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .no_proxy()
+            .build()
+            .context("Failed to create direct HTTP client")?;
+
         info!(
             "初始化网盘客户端成功, UID={}, PTOKEN={}",
             user_auth.uid,
@@ -130,6 +150,7 @@ impl NetdiskClient {
 
         Ok(Self {
             client,
+            direct_client,
             cookie_jar: jar,
             user_auth,
             mobile_user_agent: Self::default_mobile_user_agent(),
@@ -137,6 +158,9 @@ impl NetdiskClient {
             web_session_ready,
             panpsc_cookie,
             bdstoken,
+            proxy_config: proxy_config.clone(),
+            proxy_upload_mode: std::sync::Arc::new(AtomicBool::new(true)),
+            last_proxy_probe: std::sync::Arc::new(Mutex::new(Instant::now())),
         })
     }
 
@@ -1031,6 +1055,36 @@ impl NetdiskClient {
         Ok(rapid_response)
     }
 
+    fn should_use_temporary_fallback(&self) -> bool {
+        self.proxy_config.is_enabled() && self.proxy_config.allow_temporary_fallback
+    }
+
+    async fn maybe_probe_proxy_upload_server(&self) {
+        if !self.should_use_temporary_fallback() {
+            return;
+        }
+        if self.proxy_upload_mode.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let interval_secs = self.proxy_config.fallback_probe_interval_secs.clamp(10, 60);
+        {
+            let mut last_probe = self.last_proxy_probe.lock().await;
+            if last_probe.elapsed().as_secs() < interval_secs {
+                return;
+            }
+            *last_probe = Instant::now();
+        }
+
+        if self.locate_upload().await.is_ok() {
+            self.proxy_upload_mode.store(true, Ordering::SeqCst);
+            info!(
+                "代理上传探测恢复成功，切回代理上传 (探测间隔={}s)",
+                interval_secs
+            );
+        }
+    }
+
     // =====================================================
     // 上传服务器定位
     // =====================================================
@@ -1158,6 +1212,58 @@ impl NetdiskClient {
         Ok(precreate_response)
     }
 
+    async fn send_upload_chunk_request(
+        &self,
+        http_client: &Client,
+        url: &str,
+        data: &[u8],
+        bandwidth_limiter: Option<Arc<BandwidthLimiter>>,
+    ) -> Result<reqwest::Response> {
+        let part = if let Some(limiter) = bandwidth_limiter {
+            const UPLOAD_PACING_SLICE: usize = 32 * 1024;
+            let payload = data.to_vec();
+            let total_len = payload.len();
+            let stream = stream::unfold(
+                (payload, 0usize, limiter),
+                |(payload, offset, limiter)| async move {
+                    if offset >= payload.len() {
+                        return None;
+                    }
+
+                    let end = (offset + UPLOAD_PACING_SLICE).min(payload.len());
+                    let chunk = payload[offset..end].to_vec();
+                    limiter.acquire(chunk.len() as u64).await;
+                    Some((
+                        Ok::<Vec<u8>, std::io::Error>(chunk),
+                        (payload, end, limiter),
+                    ))
+                },
+            );
+
+            multipart::Part::stream_with_length(
+                reqwest::Body::wrap_stream(stream),
+                total_len as u64,
+            )
+            .file_name("file")
+            .mime_str("application/octet-stream")?
+        } else {
+            multipart::Part::bytes(data.to_vec())
+                .file_name("file")
+                .mime_str("application/octet-stream")?
+        };
+
+        let form = multipart::Form::new().part("file", part);
+
+        http_client
+            .post(url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.mobile_user_agent)
+            .multipart(form)
+            .send()
+            .await
+            .context("上传分片请求发送失败")
+    }
+
     /// 上传分片
     ///
     /// # 参数
@@ -1175,6 +1281,7 @@ impl NetdiskClient {
         part_seq: usize,
         data: Vec<u8>,
         server: Option<&str>,
+        bandwidth_limiter: Option<Arc<BandwidthLimiter>>,
     ) -> Result<UploadChunkResponse> {
         // 使用传入的服务器或默认值
         let pcs_server = server.unwrap_or("d.pcs.baidu.com");
@@ -1204,22 +1311,39 @@ impl NetdiskClient {
             part_seq
         );
 
-        // 构建 multipart form
-        let part = multipart::Part::bytes(data)
-            .file_name("file")
-            .mime_str("application/octet-stream")?;
+        self.maybe_probe_proxy_upload_server().await;
 
-        let form = multipart::Form::new().part("file", part);
+        let use_fallback = self.should_use_temporary_fallback();
+        let prefer_proxy = !use_fallback || self.proxy_upload_mode.load(Ordering::SeqCst);
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
-            .header("User-Agent", &self.mobile_user_agent)
-            .multipart(form)
-            .send()
-            .await
-            .context("上传分片请求发送失败")?;
+        let response = if prefer_proxy {
+            match self
+                .send_upload_chunk_request(&self.client, &url, &data, bandwidth_limiter.clone())
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) if use_fallback => {
+                    warn!(
+                        "上传分片经代理发送失败，临时切换直连重试: part={}, server={}, err={}",
+                        part_seq, pcs_server, e
+                    );
+                    self.proxy_upload_mode.store(false, Ordering::SeqCst);
+                    self.send_upload_chunk_request(
+                        &self.direct_client,
+                        &url,
+                        &data,
+                        bandwidth_limiter.clone(),
+                    )
+                    .await
+                    .context("上传分片请求发送失败（代理失败后直连重试）")?
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            self.send_upload_chunk_request(&self.direct_client, &url, &data, bandwidth_limiter)
+                .await
+                .context("上传分片请求发送失败（直连fallback模式）")?
+        };
 
         let status = response.status();
         let response_text = response.text().await.context("读取上传分片响应失败")?;
@@ -1228,6 +1352,14 @@ impl NetdiskClient {
             "上传分片响应: part={}, status={}, body={}",
             part_seq, status, response_text
         );
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "上传分片请求失败: status={}, body={}",
+                status,
+                response_text
+            );
+        }
 
         let chunk_response: UploadChunkResponse = serde_json::from_str(&response_text)
             .with_context(|| {

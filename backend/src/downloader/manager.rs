@@ -78,6 +78,7 @@ impl DownloadManager {
             max_global_threads,
             max_concurrent_tasks,
             max_retries,
+            0,
             ProxyConfig::default(),
         )
     }
@@ -89,6 +90,7 @@ impl DownloadManager {
         max_global_threads: usize,
         max_concurrent_tasks: usize,
         max_retries: u32,
+        speed_limit_kbps: u64,
         proxy_config: ProxyConfig,
     ) -> Result<Self> {
         // 确保下载目录存在（路径验证已在配置保存时完成）
@@ -105,7 +107,7 @@ impl DownloadManager {
             download_dir, max_global_threads, max_concurrent_tasks
         );
 
-        let engine = Arc::new(DownloadEngine::new_with_proxy(user_auth, proxy_config));
+        let engine = Arc::new(DownloadEngine::new_with_proxy(user_auth, proxy_config, speed_limit_kbps));
 
         let manager = Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
@@ -892,12 +894,14 @@ impl DownloadManager {
                         (t.slot_id, t.is_borrowed_slot)
                     };
 
+                    let direct_client = engine.create_download_client(false);
                     let task_info = TaskScheduleInfo {
                         task_id: task_id_clone.clone(),
                         task: task_clone.clone(),
                         chunk_manager,
                         speed_calc,
                         client,
+                        direct_client,
                         cookie,
                         referer,
                         url_health,
@@ -926,6 +930,10 @@ impl DownloadManager {
                         manager_tasks: Some(tasks_clone.clone()),
                         // 🔥 链接级重试次数（从配置读取）
                         max_retries,
+                        bandwidth_limiter: engine.bandwidth_limiter(),
+                        proxy_config: engine.proxy_config(),
+                        proxy_download_mode: engine.proxy_download_mode(),
+                        last_proxy_probe: engine.last_proxy_probe(),
                     };
 
                     // 注册到调度器
@@ -1529,12 +1537,14 @@ impl DownloadManager {
                                                 (t.slot_id, t.is_borrowed_slot)
                                             };
 
+                                            let direct_client = engine_clone.create_download_client(false);
                                             let task_info = TaskScheduleInfo {
                                                 task_id: id_clone.clone(),
                                                 task: task_clone.clone(),
                                                 chunk_manager,
                                                 speed_calc,
                                                 client,
+                                                direct_client,
                                                 cookie,
                                                 referer,
                                                 url_health,
@@ -1568,6 +1578,10 @@ impl DownloadManager {
                                                 manager_tasks: Some(tasks_clone.clone()),
                                                 // 🔥 链接级重试次数（从配置读取）
                                                 max_retries,
+                                                bandwidth_limiter: engine_clone.bandwidth_limiter(),
+                                                proxy_config: engine_clone.proxy_config(),
+                                                proxy_download_mode: engine_clone.proxy_download_mode(),
+                                                last_proxy_probe: engine_clone.last_proxy_probe(),
                                             };
 
                                             // 注册任务到调度器
@@ -2106,12 +2120,14 @@ impl DownloadManager {
                                                 (t.slot_id, t.is_borrowed_slot)
                                             };
 
+                                            let direct_client = engine_clone.create_download_client(false);
                                             let task_info = TaskScheduleInfo {
                                                 task_id: id_clone.clone(),
                                                 task: task_clone.clone(),
                                                 chunk_manager,
                                                 speed_calc,
                                                 client,
+                                                direct_client,
                                                 cookie,
                                                 referer,
                                                 url_health,
@@ -2145,6 +2161,10 @@ impl DownloadManager {
                                                 manager_tasks: Some(tasks_clone.clone()),
                                                 // 🔥 链接级重试次数（从配置读取）
                                                 max_retries,
+                                                bandwidth_limiter: engine_clone.bandwidth_limiter(),
+                                                proxy_config: engine_clone.proxy_config(),
+                                                proxy_download_mode: engine_clone.proxy_download_mode(),
+                                                last_proxy_probe: engine_clone.last_proxy_probe(),
                                             };
 
                                             match chunk_scheduler_clone
@@ -3991,6 +4011,11 @@ impl DownloadManager {
     ///
     /// 该方法可以在运行时调整线程池大小，无需重启下载管理器
     /// 正在进行的下载任务不受影响
+    pub async fn update_speed_limit(&self, speed_limit_kbps: u64) {
+        self.engine.update_speed_limit(speed_limit_kbps).await;
+        info!("🔧 下载管理器: 动态调整下载限速为 {} KB/s", speed_limit_kbps);
+    }
+
     pub fn update_max_threads(&self, new_max: usize) {
         self.chunk_scheduler.update_max_threads(new_max);
     }

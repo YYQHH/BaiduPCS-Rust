@@ -377,6 +377,9 @@ pub struct DownloadConfig {
     pub max_concurrent_tasks: usize,
     /// 最大重试次数
     pub max_retries: u32,
+    /// 下载限速（KB/s），0 表示不限速
+    #[serde(default)]
+    pub speed_limit_kbps: u64,
     /// CDN刷新配置
     #[serde(default)]
     pub cdn_refresh: CdnRefreshConfig,
@@ -526,6 +529,9 @@ pub struct UploadConfig {
     pub max_concurrent_tasks: usize,
     /// 最大重试次数
     pub max_retries: u32,
+    /// 上传限速（KB/s），0 表示不限速
+    #[serde(default)]
+    pub speed_limit_kbps: u64,
     /// 上传文件夹时是否跳过隐藏文件（以.开头的文件/文件夹）
     pub skip_hidden_files: bool,
     /// 最近使用的上传源目录
@@ -540,6 +546,7 @@ impl Default for UploadConfig {
             chunk_size_mb: 4, // 百度网盘上传分片最小 4MB
             max_concurrent_tasks: 5,
             max_retries: 3,
+            speed_limit_kbps: 0,
             skip_hidden_files: false, // 默认不跳过隐藏文件
             recent_directory: None,   // 默认无最近目录
         }
@@ -950,6 +957,7 @@ impl Default for AppConfig {
                 chunk_size_mb: svip_config.chunk_size,
                 max_concurrent_tasks: svip_config.max_tasks,
                 max_retries: 3,
+                speed_limit_kbps: 0,
                 cdn_refresh: CdnRefreshConfig::default(),
             },
             upload: UploadConfig::default(),
@@ -1149,6 +1157,7 @@ mod tests {
             chunk_size_mb: 10,
             max_concurrent_tasks: 2,
             max_retries: 3,
+            speed_limit_kbps: 0,
             cdn_refresh: CdnRefreshConfig::default(),
         };
 
@@ -1179,6 +1188,7 @@ mod tests {
             chunk_size_mb: 10,
             max_concurrent_tasks: 2,
             max_retries: 3,
+            speed_limit_kbps: 0,
             cdn_refresh: CdnRefreshConfig::default(),
         };
         assert!(absolute_config.validate_download_dir().is_ok());
@@ -1193,6 +1203,7 @@ mod tests {
             chunk_size_mb: 10,
             max_concurrent_tasks: 2,
             max_retries: 3,
+            speed_limit_kbps: 0,
             cdn_refresh: CdnRefreshConfig::default(),
         };
         assert!(relative_config.validate_download_dir().is_err());
@@ -1209,6 +1220,7 @@ mod tests {
                 chunk_size_mb: 10,
                 max_concurrent_tasks: 2,
                 max_retries: 3,
+                speed_limit_kbps: 0,
                 cdn_refresh: CdnRefreshConfig::default(),
             };
             assert!(windows_config.validate_download_dir().is_ok());
@@ -1225,6 +1237,7 @@ mod tests {
                 chunk_size_mb: 10,
                 max_concurrent_tasks: 2,
                 max_retries: 3,
+                speed_limit_kbps: 0,
                 cdn_refresh: CdnRefreshConfig::default(),
             };
             assert!(unix_config.validate_download_dir().is_ok());
