@@ -2146,10 +2146,20 @@ impl UploadManager {
 
         let old_status;
         let is_backup;
+        let is_resuming_from_failed;
         {
             let task = task_info.task.lock().await;
-            if task.status != UploadTaskStatus::Paused {
-                return Err(anyhow::anyhow!("任务不是暂停状态"));
+            match task.status {
+                UploadTaskStatus::Paused => {
+                    is_resuming_from_failed = false;
+                }
+                UploadTaskStatus::Failed => {
+                    // 允许对失败任务执行“恢复”（语义上等价于重试）
+                    is_resuming_from_failed = true;
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("任务当前状态不支持恢复（仅支持 paused/failed）"));
+                }
             }
             // 🔥 保存旧状态和 is_backup
             old_status = format!("{:?}", task.status).to_lowercase();
@@ -2168,12 +2178,16 @@ impl UploadManager {
         })
             .await;
 
-        // 🔥 发送恢复事件
+        // 🔥 发送恢复事件（failed 场景可视为重试恢复）
         self.publish_event(UploadEvent::Resumed {
             task_id: task_id.to_string(),
             is_backup,
         })
             .await;
+
+        if is_resuming_from_failed {
+            info!("上传任务 {} 从 failed 状态恢复，按重试流程重新启动", task_id);
+        }
 
         // 🔥 如果是备份任务，发送状态变更和恢复通知到 AutoBackupManager
         if is_backup {

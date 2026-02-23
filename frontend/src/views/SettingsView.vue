@@ -109,7 +109,7 @@
                     inactive-text="关闭"
                 />
                 <div class="form-tip">
-                  当上传分片经代理失败或上传服务器无响应时，临时切换为直连上传；后台会按间隔通过代理探测恢复后自动切回代理。
+                  当代理链路无响应时，按“代理作用范围”临时切换为直连：全局模式作用于全部链路，仅传输模式仅作用于上传/下载链路；后台会按间隔通过代理探测恢复后自动切回代理。
                 </div>
               </el-form-item>
 
@@ -126,7 +126,7 @@
                     controls-position="right"
                     style="width: 100%"
                 />
-                <div class="form-tip">每隔 N 秒通过代理测试上传服务器可用性，恢复后自动切回代理。</div>
+                <div class="form-tip">每隔 N 秒通过代理测试恢复状态（按作用范围探测对应链路），恢复后自动切回代理。</div>
               </el-form-item>
 
               <el-form-item label="代理服务器" prop="network.proxy.host">

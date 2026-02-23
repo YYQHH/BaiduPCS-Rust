@@ -3,7 +3,7 @@
 use crate::auth::constants::USER_AGENT as WEB_USER_AGENT; // 导入登录时的 UA,确保一致
 use crate::auth::constants::{API_USER_INFO, BAIDU_APP_ID, CLIENT_TYPE, USER_AGENT};
 use crate::auth::UserAuth;
-use crate::common::{BandwidthLimiter, ProxyConfig};
+use crate::common::{BandwidthLimiter, ProxyConfig, ProxyScope};
 use crate::netdisk::{
     CreateFileResponse, FileListResponse, LocateDownloadResponse, PrecreateResponse,
     RapidUploadResponse, UploadChunkResponse, UploadErrorKind,
@@ -1009,26 +1009,27 @@ impl NetdiskClient {
         let url = "https://pan.baidu.com/api/create";
 
         let response = self
-            .client
-            .post(url)
-            // .query(&[("method", "create")])
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
-            .header("User-Agent", &self.mobile_user_agent)
-            .form(&[
-                ("path", remote_path),
-                ("size", &file_size.to_string()),
-                ("isdir", &is_dir),
-                ("uploadid", &upload_id),
-                // rtype 文件命名策略:
-                // 1 = path冲突时重命名 (推荐,避免覆盖)
-                // 2 = path冲突且block_list不同时重命名 (智能去重)
-                // 3 = path冲突时覆盖 (危险)
-                ("rtype", "1"),
-                ("block_list", &block_list),
-            ])
-            .send()
-            .await
-            .context("创建文件请求发送失败")?;
+            .send_with_global_fallback(
+                self.client
+                    .post(url)
+                    // .query(&[("method", "create")])
+                    .header("Cookie", format!("BDUSS={}", self.bduss()))
+                    .header("User-Agent", &self.mobile_user_agent)
+                    .form(&[
+                        ("path", remote_path),
+                        ("size", &file_size.to_string()),
+                        ("isdir", &is_dir),
+                        ("uploadid", &upload_id),
+                        // rtype 文件命名策略:
+                        // 1 = path冲突时重命名 (推荐,避免覆盖)
+                        // 2 = path冲突且block_list不同时重命名 (智能去重)
+                        // 3 = path冲突时覆盖 (危险)
+                        ("rtype", "1"),
+                        ("block_list", &block_list),
+                    ]),
+                "创建文件请求发送失败",
+            )
+            .await?;
 
         let status = response.status();
         let response_text = response.text().await.context("读取创建文件响应失败")?;
@@ -1057,6 +1058,40 @@ impl NetdiskClient {
 
     fn should_use_temporary_fallback(&self) -> bool {
         self.proxy_config.is_enabled() && self.proxy_config.allow_temporary_fallback
+    }
+
+    fn should_use_global_temporary_fallback(&self) -> bool {
+        self.should_use_temporary_fallback() && self.proxy_config.scope == ProxyScope::Default
+    }
+
+    async fn send_with_global_fallback(
+        &self,
+        request: reqwest::RequestBuilder,
+        context: &str,
+    ) -> Result<reqwest::Response> {
+        let Some(proxy_request) = request.try_clone() else {
+            return request
+                .send()
+                .await
+                .with_context(|| format!("{}（代理）", context));
+        };
+
+        match proxy_request.send().await {
+            Ok(resp) => Ok(resp),
+            Err(proxy_err) if self.should_use_global_temporary_fallback() => {
+                warn!("{}经代理失败，临时切换直连重试: {}", context, proxy_err);
+
+                let direct_request = request
+                    .build()
+                    .with_context(|| format!("{}（构建直连请求失败）", context))?;
+
+                self.direct_client
+                    .execute(direct_request)
+                    .await
+                    .with_context(|| format!("{}（代理失败后直连重试）", context))
+            }
+            Err(proxy_err) => Err(proxy_err).with_context(|| format!("{}（代理）", context)),
+        }
     }
 
     async fn maybe_probe_proxy_upload_server(&self) {
@@ -1107,13 +1142,14 @@ impl NetdiskClient {
         );
 
         let response = self
-            .client
-            .get(&url)
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
-            .header("User-Agent", &self.mobile_user_agent)
-            .send()
-            .await
-            .context("获取上传服务器请求失败")?;
+            .send_with_global_fallback(
+                self.client
+                    .get(&url)
+                    .header("Cookie", format!("BDUSS={}", self.bduss()))
+                    .header("User-Agent", &self.mobile_user_agent),
+                "获取上传服务器请求发送失败",
+            )
+            .await?;
 
         let status = response.status();
         let response_text = response.text().await.context("读取上传服务器响应失败")?;
@@ -1163,26 +1199,27 @@ impl NetdiskClient {
         let url = "https://pan.baidu.com/api/precreate";
 
         let response = self
-            .client
-            .post(url)
-            // .query(&[("method", "precreate")])
-            .header("Cookie", format!("BDUSS={}", self.bduss()))
-            .header("User-Agent", &self.mobile_user_agent)
-            .form(&[
-                ("path", remote_path),
-                ("size", &file_size.to_string()),
-                ("isdir", "0"),
-                ("autoinit", "1"),
-                // rtype 文件命名策略:
-                // 1 = path冲突时重命名 (推荐,避免覆盖)
-                // 2 = path冲突且block_list不同时重命名 (智能去重)
-                // 3 = path冲突时覆盖 (危险)
-                ("rtype", "1"),
-                ("block_list", block_list),
-            ])
-            .send()
-            .await
-            .context("预创建请求发送失败")?;
+            .send_with_global_fallback(
+                self.client
+                    .post(url)
+                    // .query(&[("method", "precreate")])
+                    .header("Cookie", format!("BDUSS={}", self.bduss()))
+                    .header("User-Agent", &self.mobile_user_agent)
+                    .form(&[
+                        ("path", remote_path),
+                        ("size", &file_size.to_string()),
+                        ("isdir", "0"),
+                        ("autoinit", "1"),
+                        // rtype 文件命名策略:
+                        // 1 = path冲突时重命名 (推荐,避免覆盖)
+                        // 2 = path冲突且block_list不同时重命名 (智能去重)
+                        // 3 = path冲突时覆盖 (危险)
+                        ("rtype", "1"),
+                        ("block_list", block_list),
+                    ]),
+                "预创建请求发送失败",
+            )
+            .await?;
 
         let status = response.status();
         let response_text = response.text().await.context("读取预创建响应失败")?;
