@@ -1069,28 +1069,36 @@ impl NetdiskClient {
         request: reqwest::RequestBuilder,
         context: &str,
     ) -> Result<reqwest::Response> {
+        let request = request
+            .build()
+            .with_context(|| format!("{}（构建请求失败）", context))?;
+
+        if !self.should_use_global_temporary_fallback() {
+            return self
+                .client
+                .execute(request)
+                .await
+                .with_context(|| format!("{}（代理）", context));
+        }
+
         let Some(proxy_request) = request.try_clone() else {
-            return request
-                .send()
+            warn!("{}请求无法克隆，无法执行代理失败后的临时直连回退", context);
+            return self
+                .client
+                .execute(request)
                 .await
                 .with_context(|| format!("{}（代理）", context));
         };
 
-        match proxy_request.send().await {
+        match self.client.execute(proxy_request).await {
             Ok(resp) => Ok(resp),
-            Err(proxy_err) if self.should_use_global_temporary_fallback() => {
+            Err(proxy_err) => {
                 warn!("{}经代理失败，临时切换直连重试: {}", context, proxy_err);
-
-                let direct_request = request
-                    .build()
-                    .with_context(|| format!("{}（构建直连请求失败）", context))?;
-
                 self.direct_client
-                    .execute(direct_request)
+                    .execute(request)
                     .await
                     .with_context(|| format!("{}（代理失败后直连重试）", context))
             }
-            Err(proxy_err) => Err(proxy_err).with_context(|| format!("{}（代理）", context)),
         }
     }
 
