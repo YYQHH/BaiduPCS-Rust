@@ -863,11 +863,19 @@
                   </template>
 
                   <el-form-item label="代理类型">
-                    <el-radio-group v-model="proxyType" @change="handleProxyTypeChange">
+                    <el-radio-group v-model="proxyType">
                       <el-radio value="none">无代理</el-radio>
                       <el-radio value="http">HTTP 代理</el-radio>
                       <el-radio value="socks5">SOCKS5 代理</el-radio>
                     </el-radio-group>
+                  </el-form-item>
+
+                  <el-form-item label="仅代理上传下载链路">
+                    <el-switch v-model="proxyTransferOnly" :disabled="proxyType === 'none'" />
+                    <div class="form-tip" style="margin-top: 4px;">
+                      开启后，仅实际文件上传和下载的数据流量使用代理；扫码登录、会话预热、文件列表等普通 API 将直接连接百度。代理测试仍通过配置的代理进行。
+                      若百度要求控制请求与传输出口 IP 一致，可关闭此开关恢复原模式。
+                    </div>
                   </el-form-item>
 
                   <template v-if="proxyType !== 'none'">
@@ -1354,6 +1362,7 @@ const proxyPort = ref(0)
 const proxyUsername = ref('')
 const proxyPassword = ref('')
 const proxyAllowFallback = ref(true)
+const proxyTransferOnly = ref(false)
 
 // 代理测试连接
 const testingProxy = ref(false)
@@ -1505,6 +1514,7 @@ async function loadConfig() {
       proxyUsername.value = p.username || ''
       proxyPassword.value = p.password || ''
       proxyAllowFallback.value = p.allow_fallback !== false
+      proxyTransferOnly.value = p.transfer_only === true
     } else {
       proxyType.value = 'none'
       proxyHost.value = ''
@@ -1512,6 +1522,7 @@ async function loadConfig() {
       proxyUsername.value = ''
       proxyPassword.value = ''
       proxyAllowFallback.value = true
+      proxyTransferOnly.value = false
     }
 
     // 同时加载推荐配置
@@ -1654,6 +1665,7 @@ async function handleSave() {
       username: proxyUsername.value || undefined,
       password: proxyPassword.value || undefined,
       allow_fallback: proxyAllowFallback.value,
+      transfer_only: proxyTransferOnly.value,
     }
     await configStore.saveConfig(formData.value)
 
@@ -1674,6 +1686,7 @@ async function handleSave() {
       console.warn('保存自动备份触发配置失败:', error)
     }
 
+    await loadConfig()
     ElMessage.success(proxyType.value !== 'none' ? '代理配置已保存并生效' : '配置已保存')
 
     // 根据代理类型启动/停止状态轮询
@@ -1725,15 +1738,6 @@ function handleDirConfirm(path: string) {
 }
 
 // 代理类型变更
-function handleProxyTypeChange(val: ProxyType) {
-  if (val === 'none') {
-    proxyHost.value = ''
-    proxyPort.value = 0
-    proxyUsername.value = ''
-    proxyPassword.value = ''
-  }
-}
-
 // 测试代理连接
 async function handleTestProxy() {
   if (!proxyHost.value || !proxyPort.value) {
@@ -1749,6 +1753,7 @@ async function handleTestProxy() {
       username: proxyUsername.value || undefined,
       password: proxyPassword.value || undefined,
       allow_fallback: proxyAllowFallback.value,
+      transfer_only: proxyTransferOnly.value,
     })
     if (resp.success) {
       ElMessage.success(`代理连接成功，延迟 ${resp.latency_ms}ms`)

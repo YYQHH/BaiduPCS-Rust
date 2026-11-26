@@ -182,6 +182,7 @@ export interface ProxyConfig {
   port: number
   username?: string
   password?: string
+  transfer_only?: boolean
   allow_fallback?: boolean
 }
 
@@ -265,7 +266,8 @@ export async function getConfig(): Promise<AppConfig> {
  * 更新配置
  */
 export async function updateConfig(config: AppConfig): Promise<string> {
-  return apiClient.put('/config', config)
+  // Saving also runs the backend's 10 second proxy diagnostic.
+  return apiClient.put('/config', config, { timeout: 30000 })
 }
 
 /**

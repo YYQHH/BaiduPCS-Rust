@@ -69,3 +69,11 @@ cleanup_on_failure = true
 # 默认关闭，避免误删用户数据
 cleanup_orphaned_on_startup = false
 
+[network.proxy]
+proxy_type = "none"
+host = ""
+port = 0
+allow_fallback = true
+# 默认关闭；开启后仅文件内容走代理，登录、预热和元数据直连。
+transfer_only = false
+

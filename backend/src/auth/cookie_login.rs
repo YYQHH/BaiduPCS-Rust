@@ -61,7 +61,7 @@ impl CookieLoginAuth {
             .user_agent(USER_AGENT);
 
         if let Some(proxy) = proxy_config {
-            builder = proxy.apply_to_builder(builder)?;
+            builder = proxy.apply_control_to_builder(builder)?;
         }
 
         let client = builder.build().context("Failed to create HTTP client")?;

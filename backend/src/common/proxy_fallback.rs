@@ -82,6 +82,9 @@ pub enum ProxyRuntimeStatus {
 pub struct ProxyFallbackManager {
     /// 连续失败计数
     consecutive_failures: AtomicU32,
+    enabled: AtomicBool,
+    allow_fallback: AtomicBool,
+    lifecycle: TokioMutex<()>,
     /// 触发回退的失败阈值（默认 3）
     failure_threshold: u32,
     /// 当前是否处于回退（直连）状态
@@ -125,6 +128,9 @@ impl ProxyFallbackManager {
     pub fn new() -> Self {
         Self {
             consecutive_failures: AtomicU32::new(0),
+            enabled: AtomicBool::new(false),
+            allow_fallback: AtomicBool::new(true),
+            lifecycle: TokioMutex::new(()),
             failure_threshold: 3,
             fallen_back: AtomicBool::new(false),
             flap_count: AtomicU32::new(0),
@@ -143,6 +149,12 @@ impl ProxyFallbackManager {
     /// 返回 true 表示需要触发回退到直连。
     /// 使用 `compare_exchange` 保证只有一个线程能触发回退（解决并发竞态）。
     pub fn record_failure(&self) -> bool {
+        if !self.enabled.load(Ordering::SeqCst)
+            || !self.allow_fallback.load(Ordering::SeqCst)
+            || self.is_fallen_back()
+        {
+            return false;
+        }
         let count = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
         if count >= self.failure_threshold {
             // 只有第一个到达阈值的线程能将 fallen_back 从 false 翻为 true
@@ -229,6 +241,13 @@ impl ProxyFallbackManager {
     ///
     /// 停止探测任务，重置所有状态
     pub async fn on_user_config_change(&self, new_proxy: Option<&ProxyConfig>) {
+        let _lifecycle = self.lifecycle.lock().await;
+        let new_proxy = new_proxy.filter(|p| p.proxy_type != super::proxy::ProxyType::None);
+        self.enabled.store(new_proxy.is_some(), Ordering::SeqCst);
+        self.allow_fallback.store(
+            new_proxy.is_some_and(|p| p.allow_fallback),
+            Ordering::SeqCst,
+        );
         if let Some(token) = self.probe_cancel_token.lock().await.take() {
             token.cancel();
             info!("用户修改代理配置，已取消探测任务");
@@ -299,6 +318,17 @@ impl ProxyFallbackManager {
     /// 仅在系统未处于回退/探测状态时更新 runtime_status，
     /// 避免覆盖 execute_fallback() 设置的 Probing/FallenBackToDirect 状态。
     pub async fn set_user_proxy_config(&self, proxy: Option<ProxyConfig>) {
+        let proxy = proxy.filter(|p| p.proxy_type != super::proxy::ProxyType::None);
+        if proxy.is_none() {
+            self.on_user_config_change(None).await;
+            return;
+        }
+        let _lifecycle = self.lifecycle.lock().await;
+        self.enabled.store(proxy.is_some(), Ordering::SeqCst);
+        self.allow_fallback.store(
+            proxy.as_ref().is_some_and(|p| p.allow_fallback),
+            Ordering::SeqCst,
+        );
         let has_proxy = proxy.is_some();
         *self.user_proxy_config.lock().await = proxy;
 
@@ -330,6 +360,10 @@ impl ProxyFallbackManager {
     /// 3. 执行热更新（切换所有 HTTP 客户端到直连）
     /// 4. 启动后台探测任务（定期检测代理是否恢复）
     pub async fn execute_fallback(self: &Arc<Self>) {
+        let _lifecycle = self.lifecycle.lock().await;
+        if !self.enabled.load(Ordering::SeqCst) || !self.allow_fallback.load(Ordering::SeqCst) {
+            return;
+        }
         self.mark_fallen_back().await;
         self.check_and_increment_flap().await;
 
@@ -389,7 +423,8 @@ pub async fn probe_proxy(proxy: &ProxyConfig) -> anyhow::Result<()> {
         .head("https://pan.baidu.com")
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("{}", friendly_proxy_error(&e)))?;
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| anyhow::anyhow!("{}", friendly_proxy_error(&e.without_url())))?;
 
     Ok(())
 }
@@ -402,6 +437,8 @@ pub async fn probe_proxy(proxy: &ProxyConfig) -> anyhow::Result<()> {
 /// 注意：此函数接受泛型 AppState-like 参数，通过 trait 解耦避免循环依赖。
 /// 实际调用时由 server 层提供具体实现。
 pub async fn perform_proxy_hot_update(updater: &dyn ProxyHotUpdater, proxy: Option<&ProxyConfig>) {
+    let direct = ProxyConfig::direct();
+    let proxy = Some(proxy.unwrap_or(&direct));
     if let Err(e) = updater.update_qrcode_auth(proxy).await {
         warn!("QRCodeAuth 热更新失败: {}", e);
     } else {
@@ -458,57 +495,69 @@ pub async fn start_proxy_probe_task(
     fallback_mgr: std::sync::Arc<ProxyFallbackManager>,
     updater: std::sync::Arc<dyn ProxyHotUpdater>,
 ) {
-    let cancel_token = CancellationToken::new();
+    start_probe_with(fallback_mgr, updater, None, |proxy| async move {
+        probe_proxy(&proxy).await
+    })
+    .await;
+}
 
-    // 取消之前的探测任务（如果有），设置新的 token
-    fallback_mgr
-        .set_probe_cancel_token(Some(cancel_token.clone()))
-        .await;
-    fallback_mgr
-        .set_runtime_status(ProxyRuntimeStatus::Probing)
-        .await;
-
-    let mgr = fallback_mgr.clone();
+async fn start_probe_with<F, Fut>(
+    mgr: Arc<ProxyFallbackManager>,
+    updater: Arc<dyn ProxyHotUpdater>,
+    interval: Option<Duration>,
+    probe: F,
+) where
+    F: Fn(ProxyConfig) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send,
+{
+    if !mgr.enabled.load(Ordering::SeqCst) || !mgr.allow_fallback.load(Ordering::SeqCst) {
+        return;
+    }
+    let cancel = CancellationToken::new();
+    mgr.set_probe_cancel_token(Some(cancel.clone())).await;
+    mgr.set_runtime_status(ProxyRuntimeStatus::Probing).await;
     tokio::spawn(async move {
         loop {
-            let interval = mgr.probe_interval();
-            // 记录 sleep 开始时间，供 next_probe_in_secs() 计算剩余秒数
             mgr.set_last_probe_sleep_started_at(Some(Instant::now()))
                 .await;
-
             tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    info!("代理探测任务已取消");
-                    break;
+                biased;
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(interval.unwrap_or_else(|| mgr.probe_interval())) => {}
+            }
+            let Some(proxy) = mgr.user_proxy_config().await else {
+                return;
+            };
+            if proxy.proxy_type == super::proxy::ProxyType::None {
+                return;
+            }
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                result = probe(proxy.clone()) => result,
+            };
+            // Serialize publication with configuration changes. A completed old
+            // probe cannot restore its stale proxy after the user chose None.
+            let _lifecycle = mgr.lifecycle.lock().await;
+            if cancel.is_cancelled()
+                || !mgr.enabled.load(Ordering::SeqCst)
+                || mgr.user_proxy_config().await.as_ref() != Some(&proxy)
+            {
+                return;
+            }
+            match result {
+                Ok(()) => {
+                    mgr.mark_restored().await;
+                    perform_proxy_hot_update(updater.as_ref(), Some(&proxy)).await;
+                    mgr.set_last_probe_sleep_started_at(None).await;
+                    return;
                 }
-                _ = tokio::time::sleep(interval) => {
-                    let user_proxy = mgr.user_proxy_config().await;
-                    if let Some(ref proxy) = user_proxy {
-                        match probe_proxy(proxy).await {
-                            Ok(()) => {
-                                info!("代理探测成功，准备切回代理");
-                                // 1. 执行热更新
-                                perform_proxy_hot_update(updater.as_ref(), Some(proxy)).await;
-                                // 2. 更新 FallbackManager 内部状态
-                                mgr.mark_restored().await;
-                                break;
-                            }
-                            Err(e) => {
-                                let flap_count = mgr.flap_count();
-                                info!(
-                                    "代理探测失败: {}，flap_count={}, 下次探测间隔: {:?}",
-                                    e,
-                                    flap_count,
-                                    mgr.probe_interval()
-                                );
-                            }
-                        }
-                    } else {
-                        // 用户配置已被清除，停止探测
-                        info!("用户代理配置已清除，停止探测");
-                        break;
-                    }
-                }
+                Err(e) => info!(
+                    "代理探测失败: {}，flap_count={}, 下次探测间隔: {:?}",
+                    e,
+                    mgr.flap_count(),
+                    mgr.probe_interval()
+                ),
             }
         }
     });
@@ -519,6 +568,104 @@ mod tests {
     use super::*;
     use crate::common::ProxyType;
 
+    #[derive(Default)]
+    struct TestUpdater(TokioMutex<Vec<Option<ProxyConfig>>>);
+    #[async_trait::async_trait]
+    impl ProxyHotUpdater for TestUpdater {
+        async fn update_qrcode_auth(&self, p: Option<&ProxyConfig>) -> anyhow::Result<()> {
+            self.0.lock().await.push(p.cloned());
+            Ok(())
+        }
+        async fn update_netdisk_client(&self, _: Option<&ProxyConfig>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_download_engine(&self, _: Option<&ProxyConfig>) {}
+        async fn update_upload_engine(&self, _: Option<&ProxyConfig>) {}
+        async fn update_transfer_engine(&self, _: Option<&ProxyConfig>) {}
+        async fn update_cloud_dl_monitor(&self, _: Option<&ProxyConfig>) {}
+        async fn update_folder_download_manager(&self, _: Option<&ProxyConfig>) {}
+        async fn update_autobackup_manager(&self, _: Option<&ProxyConfig>) {}
+    }
+
+    #[tokio::test]
+    async fn disabled_proxy_cancels_inflight_probe_and_rejects_stale_fallback() {
+        let mgr = Arc::new(ProxyFallbackManager::new());
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
+        let updater = Arc::new(TestUpdater::default());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (started, finish) = (entered.clone(), release.clone());
+        start_probe_with(
+            mgr.clone(),
+            updater.clone(),
+            Some(Duration::from_millis(1)),
+            move |_| {
+                let (started, finish) = (started.clone(), finish.clone());
+                async move {
+                    started.notify_one();
+                    finish.notified().await;
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let disabled = ProxyConfig {
+            proxy_type: ProxyType::None,
+            ..make_proxy_config(true)
+        };
+        mgr.on_user_config_change(Some(&disabled)).await;
+        release.notify_one();
+        mgr.execute_fallback().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(mgr.runtime_status().await, ProxyRuntimeStatus::NoProxy);
+        assert!(!mgr.is_fallen_back());
+        assert!(mgr.user_proxy_config().await.is_none());
+        assert!(mgr.next_probe_in_secs().await.is_none());
+        assert!(
+            updater.0.lock().await.is_empty(),
+            "old probe must not republish its proxy"
+        );
+        for _ in 0..10 {
+            assert!(!mgr.record_failure());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_restores_original_scope_and_fallback_is_explicit_direct() {
+        let mgr = Arc::new(ProxyFallbackManager::new());
+        let mut cfg = make_proxy_config(true);
+        cfg.transfer_only = true;
+        mgr.set_user_proxy_config(Some(cfg.clone())).await;
+        let updater = Arc::new(TestUpdater::default());
+        perform_proxy_hot_update(updater.as_ref(), None).await;
+        let direct = updater.0.lock().await[0].clone().unwrap();
+        assert_eq!(direct.proxy_type, ProxyType::None);
+        assert!(direct.transfer_only);
+        mgr.mark_fallen_back().await;
+        start_probe_with(
+            mgr.clone(),
+            updater.clone(),
+            Some(Duration::from_millis(1)),
+            |_| async { Ok(()) },
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while updater.0.lock().await.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(mgr.runtime_status().await, ProxyRuntimeStatus::Normal);
+        assert!(!mgr.is_fallen_back());
+        assert_eq!(updater.0.lock().await[1].as_ref(), Some(&cfg));
+        mgr.on_user_config_change(None).await;
+    }
+
     fn make_proxy_config(allow_fallback: bool) -> ProxyConfig {
         ProxyConfig {
             proxy_type: ProxyType::Http,
@@ -527,12 +674,15 @@ mod tests {
             username: None,
             password: None,
             allow_fallback,
+            transfer_only: false,
         }
     }
 
     #[tokio::test]
     async fn test_record_failure_triggers_fallback_at_threshold() {
         let mgr = ProxyFallbackManager::new();
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
         // 默认阈值为 3
         assert!(!mgr.record_failure()); // 1
         assert!(!mgr.record_failure()); // 2
@@ -543,6 +693,8 @@ mod tests {
     #[tokio::test]
     async fn test_record_failure_only_first_thread_triggers() {
         let mgr = ProxyFallbackManager::new();
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
         mgr.record_failure(); // 1
         mgr.record_failure(); // 2
         assert!(mgr.record_failure());  // 3 → 第一个触发
@@ -553,6 +705,8 @@ mod tests {
     #[tokio::test]
     async fn test_record_success_resets_count() {
         let mgr = ProxyFallbackManager::new();
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
         mgr.record_failure(); // 1
         mgr.record_failure(); // 2
         mgr.record_success(); // 重置
@@ -564,6 +718,8 @@ mod tests {
     #[tokio::test]
     async fn test_probe_interval_escalation() {
         let mgr = ProxyFallbackManager::new();
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
         // flap_count = 0
         assert_eq!(mgr.probe_interval(), Duration::from_secs(30));
 
@@ -589,6 +745,8 @@ mod tests {
     #[tokio::test]
     async fn test_check_and_increment_flap_within_window() {
         let mgr = ProxyFallbackManager::new();
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
         // 模拟刚刚恢复
         *mgr.last_proxy_restore_time.lock().await = Some(Instant::now());
 
@@ -603,9 +761,10 @@ mod tests {
     #[tokio::test]
     async fn test_check_and_increment_flap_outside_window() {
         let mgr = ProxyFallbackManager::new();
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
         // 模拟很久以前恢复（超过稳定窗口）
-        *mgr.last_proxy_restore_time.lock().await =
-            Some(Instant::now() - Duration::from_secs(600));
+        *mgr.last_proxy_restore_time.lock().await = Some(Instant::now() - Duration::from_secs(600));
 
         mgr.flap_count.store(5, Ordering::SeqCst);
 
@@ -617,6 +776,8 @@ mod tests {
     #[tokio::test]
     async fn test_on_user_config_change_resets_all() {
         let mgr = ProxyFallbackManager::new();
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
         let proxy = make_proxy_config(true);
 
         // 设置一些状态
@@ -642,6 +803,8 @@ mod tests {
     #[tokio::test]
     async fn test_on_user_config_change_to_none() {
         let mgr = ProxyFallbackManager::new();
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
 
         // 用户清除代理配置
         mgr.on_user_config_change(None).await;
@@ -653,6 +816,8 @@ mod tests {
     #[tokio::test]
     async fn test_mark_fallen_back_and_restored() {
         let mgr = ProxyFallbackManager::new();
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
 
         // 触发回退
         mgr.record_failure();
@@ -674,18 +839,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_allow_fallback_false_still_returns_true() {
-        // allow_fallback=false 时，record_failure 仍然返回 true（达到阈值时）
-        // 但调用方应检查 allow_fallback 并决定是否执行回退
+    async fn test_allow_fallback_false_never_marks_direct() {
         let mgr = ProxyFallbackManager::new();
-        mgr.set_user_proxy_config(Some(make_proxy_config(false))).await;
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
+        mgr.set_user_proxy_config(Some(make_proxy_config(false)))
+            .await;
 
         mgr.record_failure();
         mgr.record_failure();
         let should_fallback = mgr.record_failure();
 
-        // record_failure 本身不检查 allow_fallback，它只管计数和 compare_exchange
-        assert!(should_fallback);
+        assert!(!should_fallback);
+        assert!(!mgr.is_fallen_back());
 
         // 调用方应该检查 allow_fallback
         let config = mgr.user_proxy_config().await.unwrap();
@@ -736,6 +902,8 @@ mod tests {
     #[tokio::test]
     async fn test_set_user_proxy_config_preserves_status_when_fallen_back() {
         let mgr = ProxyFallbackManager::new();
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
 
         // 先设置代理配置
         mgr.set_user_proxy_config(Some(make_proxy_config(true))).await;
@@ -755,14 +923,19 @@ mod tests {
     #[tokio::test]
     async fn test_next_probe_in_secs_none_when_not_probing() {
         let mgr = ProxyFallbackManager::new();
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
         assert_eq!(mgr.next_probe_in_secs().await, None);
     }
 
     #[tokio::test]
     async fn test_next_probe_in_secs_returns_remaining() {
         let mgr = ProxyFallbackManager::new();
+        mgr.set_user_proxy_config(Some(make_proxy_config(true)))
+            .await;
         // 模拟刚开始 sleep
-        mgr.set_last_probe_sleep_started_at(Some(Instant::now())).await;
+        mgr.set_last_probe_sleep_started_at(Some(Instant::now()))
+            .await;
 
         let remaining = mgr.next_probe_in_secs().await;
         assert!(remaining.is_some());

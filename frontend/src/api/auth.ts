@@ -1,6 +1,6 @@
 // 认证API封装
 
-import axios from 'axios'
+import axios, { type AxiosError } from 'axios'
 import { addWebAuthInterceptor } from './client'
 
 const apiClient = axios.create({
@@ -18,9 +18,13 @@ addWebAuthInterceptor(apiClient)
 // 响应拦截器
 apiClient.interceptors.response.use(
     response => response.data,
-    error => {
-      console.error('API Error:', error)
-      return Promise.reject(error)
+    (error: AxiosError) => {
+      // AxiosError.config may contain a QR sign or the submitted Cookie body.
+      const message = error.code === 'ECONNABORTED'
+          ? '认证请求超时，请重试'
+          : `认证请求失败${error.response ? ` (HTTP ${error.response.status})` : '，请检查连接'}`
+      console.error(message)
+      return Promise.reject(new Error(message))
     }
 )
 
@@ -51,7 +55,7 @@ export interface UserAuth {
 }
 
 export interface QRCodeStatus {
-  status: 'waiting' | 'scanned' | 'success' | 'expired' | 'failed'
+  status: 'initializing' | 'waiting' | 'scanned' | 'success' | 'expired' | 'failed'
   user?: UserAuth
   reason?: string
 }
@@ -59,8 +63,8 @@ export interface QRCodeStatus {
 /**
  * 生成登录二维码
  */
-export async function generateQRCode(): Promise<QRCode> {
-  const response = (await apiClient.post('/auth/qrcode/generate')) as ApiResponse<QRCode>
+export async function generateQRCode(replace?: string): Promise<QRCode> {
+  const response = (await apiClient.post('/auth/qrcode/generate', null, { params: { replace } })) as ApiResponse<QRCode>
   if (response.code !== 0 || !response.data) {
     throw new Error(response.message || '生成二维码失败')
   }
@@ -77,7 +81,7 @@ export async function generateQRCode(): Promise<QRCode> {
 export async function getQRCodeStatus(sign: string, addMode = false): Promise<QRCodeStatus> {
   const params = new URLSearchParams({ sign })
   if (addMode) params.set('add', 'true')
-  const response = (await apiClient.get(`/auth/qrcode/status?${params.toString()}`)) as ApiResponse<QRCodeStatus>
+  const response = (await apiClient.get(`/auth/qrcode/status?${params.toString()}`, { timeout: 120000 })) as ApiResponse<QRCodeStatus>
   if (response.code !== 0 || !response.data) {
     throw new Error(response.message || '查询状态失败')
   }
@@ -117,4 +121,8 @@ export async function cookieLogin(cookies: string): Promise<CookieLoginResult> {
  */
 export async function logout(): Promise<void> {
   await apiClient.post('/auth/logout')
+}
+
+export async function cancelQRCode(sign: string): Promise<void> {
+  await apiClient.post('/auth/qrcode/cancel', { sign })
 }

@@ -56,17 +56,88 @@ impl<T> ApiResponse<T> {
     }
 }
 
+/// Each sign owns its mutex; remote I/O never holds the registry/session lock.
+#[derive(Default)]
+pub struct LoginAttempts {
+    entries: std::sync::Mutex<std::collections::HashMap<String, Arc<LoginAttempt>>>,
+}
+
+#[derive(Default)]
+struct LoginProgress {
+    confirmed: Option<UserAuth>,
+    ready: bool,
+    base_saved: bool,
+}
+
+struct LoginAttempt {
+    progress: tokio::sync::Mutex<LoginProgress>,
+    cancel: tokio_util::sync::CancellationToken,
+    created: std::time::Instant,
+}
+
+impl LoginAttempts {
+    fn register(&self, sign: String, replace: Option<&str>) {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(old) = replace.and_then(|s| entries.remove(s)) {
+            old.cancel.cancel();
+        }
+        entries.retain(|_, a| {
+            let keep = a.created.elapsed() < std::time::Duration::from_secs(300);
+            if !keep {
+                a.cancel.cancel();
+            }
+            keep
+        });
+        // Bound unauthenticated state without retaining credentials indefinitely.
+        if entries.len() >= 64 {
+            if let Some(key) = entries
+                .iter()
+                .min_by_key(|(_, a)| a.created)
+                .map(|(k, _)| k.clone())
+            {
+                if let Some(old) = entries.remove(&key) {
+                    old.cancel.cancel();
+                }
+            }
+        }
+        entries.insert(
+            sign,
+            Arc::new(LoginAttempt {
+                progress: tokio::sync::Mutex::new(LoginProgress::default()),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                created: std::time::Instant::now(),
+            }),
+        );
+    }
+
+    pub fn cancel_all(&self) {
+        for (_, attempt) in self.entries.lock().unwrap().drain() {
+            attempt.cancel.cancel();
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+pub struct GenerateQRCodeQuery {
+    replace: Option<String>,
+}
+
 /// 生成登录二维码
 ///
 /// POST /api/v1/auth/qrcode/generate
 pub async fn generate_qrcode(
     State(state): State<AppState>,
+    Query(params): Query<GenerateQRCodeQuery>,
 ) -> Result<Json<ApiResponse<QRCode>>, StatusCode> {
     info!("API: 生成登录二维码");
 
-    match state.qrcode_auth.read().await.generate_qrcode().await {
+    let auth = state.qrcode_auth.read().await.clone();
+    match auth.generate_qrcode().await {
         Ok(qrcode) => {
-            info!("二维码生成成功: sign={}", qrcode.sign);
+            state
+                .login_attempts
+                .register(qrcode.sign.clone(), params.replace.as_deref());
+            info!("二维码生成成功");
             Ok(Json(ApiResponse::success(qrcode)))
         }
         Err(e) => {
@@ -92,6 +163,23 @@ pub struct QRCodeStatusQuery {
     pub add: bool,
 }
 
+/// Cancel only this browser's attempt; late network results are discarded.
+pub async fn cancel_qrcode(
+    State(state): State<AppState>,
+    Json(params): Json<QRCodeStatusQuery>,
+) -> Json<ApiResponse<()>> {
+    if let Some(attempt) = state
+        .login_attempts
+        .entries
+        .lock()
+        .unwrap()
+        .remove(&params.sign)
+    {
+        attempt.cancel.cancel();
+    }
+    Json(ApiResponse::success(()))
+}
+
 /// 查询扫码状态
 ///
 /// GET /api/v1/auth/qrcode/status?sign=xxx
@@ -99,54 +187,56 @@ pub async fn qrcode_status(
     State(state): State<AppState>,
     Query(params): Query<QRCodeStatusQuery>,
 ) -> Result<Json<ApiResponse<QRCodeStatusResponse>>, StatusCode> {
-    info!("API: 查询扫码状态: sign={}", params.sign);
-
-    // 防呆：检查是否已有有效的活跃账号会话
-    // 从 active_uid → AccountManager 取，不再读 legacy session.json
-    //
-    // 注意：添加账号模式（add=true）下用户本就已有活跃账号，必须跳过此短路，
-    // 否则会在尚未扫码时直接用旧账号返回 Success，误报"账号添加成功"。
-    if !params.add {
-        if let Some(user) = state.active_user_auth().await {
-            info!(
-                "检测到已有活跃账号: UID={}, 验证 BDUSS 有效性...",
-                user.uid
-            );
-
-            match state.qrcode_auth.read().await.verify_bduss(&user.bduss).await {
-                Ok(true) => {
-                    info!("✅ BDUSS 仍然有效，直接返回登录成功状态");
-
-                    // 确保活跃账号客户端已初始化
-                    let client_initialized = state.active_client().await.is_some();
-                    if !client_initialized {
-                        info!("🔄 客户端未初始化，开始初始化用户资源...");
-                        if let Err(e) = state.load_initial_session().await {
-                            error!("❌ 初始化用户资源失败: {}", e);
-                        } else {
-                            info!("✅ 用户资源初始化成功");
-                        }
-                    }
-
-                    // 直接返回 Success 状态（脱敏，不回传凭证）
-                    return Ok(Json(ApiResponse::success(QRCodeStatusResponse::Success {
-                        user: PublicUserInfo::from(&user),
-                    })));
-                }
-                Ok(false) => {
-                    warn!("⚠️ 持久化的 BDUSS 已失效，继续扫码流程");
-                    // BDUSS 失效不再触发 session.json 清除：legacy session 已被
-                    // accounts.json 取代，由 set_active_uid / force_delete 等专用路径
-                    // 处理凭据失效。
-                }
-                Err(e) => {
-                    warn!("⚠️ BDUSS 验证出错: {}，继续扫码流程", e);
-                }
-            }
+    let attempt = state
+        .login_attempts
+        .entries
+        .lock()
+        .unwrap()
+        .get(&params.sign)
+        .cloned();
+    let Some(attempt) = attempt else {
+        return Ok(Json(ApiResponse::success(QRCodeStatusResponse::Expired)));
+    };
+    if attempt.cancel.is_cancelled()
+        || attempt.created.elapsed() >= std::time::Duration::from_secs(300)
+    {
+        return Ok(Json(ApiResponse::success(QRCodeStatusResponse::Expired)));
+    }
+    let Ok(mut progress) = attempt.progress.try_lock() else {
+        return Ok(Json(ApiResponse::success(
+            QRCodeStatusResponse::Initializing,
+        )));
+    };
+    if progress.ready {
+        return Ok(Json(ApiResponse::success(QRCodeStatusResponse::Success {
+            user: PublicUserInfo::from(progress.confirmed.as_ref().unwrap()),
+        })));
+    }
+    tokio::select! {
+        biased;
+        _ = attempt.cancel.cancelled() => Ok(Json(ApiResponse::success(QRCodeStatusResponse::Expired))),
+        result = tokio::time::timeout(std::time::Duration::from_secs(110),
+            initialize_qrcode(&state, &params, &mut progress)) => {
+            result.unwrap_or_else(|_| Ok(Json(ApiResponse::error(504, "登录初始化超时，请重试".into()))))
         }
     }
+}
 
-    match state.qrcode_auth.read().await.poll_status(&params.sign).await {
+async fn initialize_qrcode(
+    state: &AppState,
+    params: &QRCodeStatusQuery,
+    progress: &mut LoginProgress,
+) -> Result<Json<ApiResponse<QRCodeStatusResponse>>, StatusCode> {
+    let auth = state.qrcode_auth.read().await.clone();
+    let status = if let Some(user) = progress.confirmed.clone() {
+        Ok(QRCodeStatus::Success {
+            token: user.bduss.clone(),
+            user,
+        })
+    } else {
+        auth.poll_status(&params.sign).await
+    };
+    match status {
         Ok(status) => {
             // 如果登录成功，保存会话并初始化用户资源
             if let QRCodeStatus::Success { ref user, .. } = status {
@@ -154,12 +244,18 @@ pub async fn qrcode_status(
                     "检测到登录成功，准备保存会话: UID={}, 用户名={}",
                     user.uid, user.username
                 );
-                let mut session = state.session_manager.lock().await;
+                progress.confirmed = Some(user.clone());
 
                 // 先保存基本会话信息
-                if let Err(e) = session.save_session(user).await {
-                    error!("❌ 保存会话失败: {}", e);
-                    return Ok(Json(ApiResponse::success((&status).into())));
+                if !progress.base_saved {
+                    if let Err(e) = state.session_manager.lock().await.save_session(user).await {
+                        error!("❌ 保存会话失败: {}", e);
+                        return Ok(Json(ApiResponse::error(
+                            500,
+                            "登录初始化失败，请重试".into(),
+                        )));
+                    }
+                    progress.base_saved = true;
                 }
 
                 info!(
@@ -169,7 +265,6 @@ pub async fn qrcode_status(
                 );
 
                 // 初始化用户资源（网盘客户端和下载管理器）
-                *state.current_user.write().await = Some(user.clone());
 
                 // 初始化网盘客户端
                 let config_guard = state.config.read().await;
@@ -194,7 +289,10 @@ pub async fn qrcode_status(
                     Ok(c) => c,
                     Err(e) => {
                         error!("初始化网盘客户端失败: {}", e);
-                        return Ok(Json(ApiResponse::success((&status).into())));
+                        return Ok(Json(ApiResponse::error(
+                            500,
+                            "登录初始化失败，请重试".into(),
+                        )));
                     }
                 };
 
@@ -203,6 +301,12 @@ pub async fn qrcode_status(
                 let mut updated_user = user.clone();
                 match client.warmup_and_get_cookies().await {
                     Ok((panpsc, csrf_token, bdstoken, stoken)) => {
+                        if bdstoken.as_ref().is_none_or(|v| v.is_empty()) {
+                            return Ok(Json(ApiResponse::error(
+                                503,
+                                "会话已保存，但 Web 初始化未获取到 bdstoken，请重试".into(),
+                            )));
+                        }
                         info!("预热成功,保存预热 Cookie 到 session.json");
                         if panpsc.is_some() {
                             updated_user.panpsc = panpsc;
@@ -218,12 +322,22 @@ pub async fn qrcode_status(
 
                         // 更新内存和持久化
                         *state.current_user.write().await = Some(updated_user.clone());
-                        if let Err(e) = session.save_session(&updated_user).await {
+                        if let Err(e) = state
+                            .session_manager
+                            .lock()
+                            .await
+                            .save_session(&updated_user)
+                            .await
+                        {
                             error!("保存预热 Cookie 失败: {}", e);
                         }
                     }
                     Err(e) => {
-                        warn!("预热失败(继续使用未预热的客户端): {}", e);
+                        warn!("预热失败，保留基础会话: {}", e);
+                        return Ok(Json(ApiResponse::error(
+                            503,
+                            format!("会话已保存，但初始化失败，请重试: {}", e),
+                        )));
                     }
                 }
 
@@ -498,18 +612,28 @@ pub async fn qrcode_status(
                         info!("✅ 离线下载监听服务初始化完成");
 
                         // 🔥 登录成功后激活账号 + 广播事件
-                        if let Err(e) =
-                            add_account_and_activate(&state, updated_user.clone()).await
+                        if let Err(e) = add_account_and_activate(state, updated_user.clone()).await
                         {
                             error!("qrcode_status add_account_and_activate 失败: {}", e);
+                            return Ok(Json(ApiResponse::error(
+                                500,
+                                "激活账号失败，请重试".into(),
+                            )));
                         }
                     }
                     Err(e) => {
                         error!("❌ 初始化下载管理器失败: {}", e);
+                        return Ok(Json(ApiResponse::error(
+                            500,
+                            "初始化下载管理器失败，请重试".into(),
+                        )));
                     }
                 }
             }
 
+            if matches!(status, QRCodeStatus::Success { .. }) {
+                progress.ready = true;
+            }
             Ok(Json(ApiResponse::success((&status).into())))
         }
         Err(e) => {
@@ -594,6 +718,7 @@ pub async fn get_current_user(
 /// per-uid Manager + 移除 client_pool + 删除 AccountManager 条目 + 广播事件。
 pub async fn logout(State(state): State<AppState>) -> Result<impl IntoResponse, StatusCode> {
     info!("API: 用户登出");
+    state.login_attempts.cancel_all();
 
     // 1. 清除持久化 session（文件 + 内存缓存）— legacy 字段保留
     let clear_result = {
@@ -869,4 +994,40 @@ pub async fn delete_account_helper(
     broadcast_account_list_changed(state).await;
 
     Ok(new_active)
+}
+
+#[cfg(test)]
+mod login_attempt_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn same_sign_is_single_flight_and_other_sign_is_independent() {
+        let attempts = LoginAttempts::default();
+        attempts.register("synthetic-a".into(), None);
+        attempts.register("synthetic-b".into(), None);
+        let a = attempts.entries.lock().unwrap()["synthetic-a"].clone();
+        let b = attempts.entries.lock().unwrap()["synthetic-b"].clone();
+        let mut guard = a.progress.lock().await;
+        for _ in 0..5 {
+            assert!(a.progress.try_lock().is_err());
+        }
+        assert!(b.progress.try_lock().is_ok());
+        guard.ready = true;
+        drop(guard);
+        assert!(a.progress.try_lock().unwrap().ready);
+    }
+
+    #[tokio::test]
+    async fn refresh_and_logout_cancel_old_work() {
+        let attempts = LoginAttempts::default();
+        attempts.register("old".into(), None);
+        let old = attempts.entries.lock().unwrap()["old"].clone();
+        attempts.register("new".into(), Some("old"));
+        assert!(old.cancel.is_cancelled());
+        let new = attempts.entries.lock().unwrap()["new"].clone();
+        assert!(!new.cancel.is_cancelled());
+        attempts.cancel_all();
+        assert!(new.cancel.is_cancelled());
+        assert!(attempts.entries.lock().unwrap().is_empty());
+    }
 }

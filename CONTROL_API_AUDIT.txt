@@ -1,0 +1,74 @@
+控制 API 代理路径复核（2026-11-26，JST）
+
+结论适用条件：启用 HTTP/SOCKS5 代理，且 network.proxy.transfer_only = true。
+此时以下百度控制 API 均走明确 no_proxy() 的控制客户端，没有改用 transfer_client。
+transfer_only = false 时有意保留原全局代理行为；代理诊断仍明确经过配置的代理。
+
+1. 逐项检查
+
+backend/src/netdisk/client.rs：
+  create_file -> POST /api/create -> self.client（创建/合并的元数据表单，不上传文件内容）。
+  create_folder -> POST /api/create?a=commit -> build_temp_client_with_proxy（名称沿用上游，内部为 control builder）。
+  precreate -> POST /api/precreate -> self.client。
+  locate_upload/get_upload_servers -> locate_upload_once -> self.client。
+  get_locate_download_url/get_download_url -> get_locate_download_url_once -> self.client。
+  get_file_list/search_files/filemetas -> self.client；filemetas 复用列表查找。
+  share_set -> POST /share/pset -> self.client。
+  share_cancel -> POST /share/cancel -> self.client。
+  share_mexpire -> build_share_mexpire_request -> self.client.execute。
+  share_list -> GET /share/record -> self.client。
+  share_surl_info -> GET /share/surlinfoinrecord -> self.client。
+  delete_files/copy_files/move_files/rename_file -> 临时 control client。
+  文件操作和转存任务状态轮询 -> 主/临时 control client。
+  cloud_dl_* -> self.client（百度服务器执行的离线任务，未传输本机文件内容）。
+  verify_bduss/fetch_vip_level/预热/刷新 -> self.client。
+
+个人版分享：
+  share/personal.rs 委托 *_personal 方法。
+  分享页面、提取码验证使用 self.client。
+  根/子目录列表、转存及任务查询使用 self.client 或 build_temp_client_with_proxy。
+  randsk Cookie 覆盖分支仍使用 control builder，不会通过修改 Jar 切换到传输代理。
+
+企业版分享：
+  share/apaas.rs 的页面、验证、目录列表、转存及任务查询均经过 send_share_request。
+  send_share_request 无 randsk 时使用 self.client；有 randsk 时使用临时 control client。
+
+实际文件内容：
+  upload_chunk -> send_upload_chunk -> transfer_client，沿用传输代理/回退。
+  DownloadEngine 分片和 Range 请求 -> 共享下载 client，沿用传输代理/回退。
+  下载链接测速本身会 GET 64KB Range 文件数据，因此属于传输数据，继续走代理。
+  代理连接测试/恢复的 HEAD 请求属于明确的诊断例外，继续强制经过代理。
+  独立 Gotify/Webhook 通知客户端不使用 app.toml 的此代理配置，保持原行为。
+
+2. 新增实际 API 方法的本地回归
+
+用例：backend/src/netdisk/proxy_tests.rs::actual_create_and_share_api_methods_bypass_proxy。
+分别启用 HTTP 和 SOCKS5 配置，真实调用下面 15 个 API 方法/发送路径：
+  创建文件、创建目录、预创建、文件列表、上传服务器获取、下载取链、创建分享、取消分享、
+  修改分享有效期、分享列表、分享详情、删除文件、企业分享列表、企业转存、带 randsk 的个人转存。
+
+断言：
+  两轮总计 30 个请求到达本地源站；配置的假代理收到 0 个请求。
+  创建文件请求包含 uploadid 元数据，创建分享请求包含 path_list，确认不是只测试 URL 名称。
+  覆盖主客户端、手动 Cookie 临时客户端、build/execute 分享有效期请求及两种分享发送分支。
+
+测试地址重定向入口全部位于 #[cfg(test)] 下，仅测试构建可用。
+生产环境仍使用原百度 URL、参数、请求方法、Cookie、TLS 策略和业务实现；未修改实际代理路由。
+mock 使用合成 Cookie/token/文件名，无真实百度请求、真实分享或网盘文件操作。
+
+命令：
+  cd backend
+  cargo test --locked
+  cargo test --locked --lib actual_create_and_share_api_methods_bypass_proxy -- --nocapture
+  cargo check --locked
+结果与日志见 ../verification/control-api-*.log。
+完整回归共 1541 个单测，前端沿用此前 399 个测试的通过结果。
+
+3. 交付方式
+
+fork： https://github.com/YYQHH/BaiduPCS-Rust
+新分支：patch_v2.4.2
+基线：745b74e1b730495d09111dae42d0db15fa4d9367（此前检查的 v2.4.2 checkout）。
+fork 的 main 当前是更早的独立历史，因此不把修改移植到旧 main，也不覆盖 main。
+全部修复、测试、文档合并为一个提交：fix: 修正互斥锁，添加仅传输链路代理功能。
+不创建 PR。

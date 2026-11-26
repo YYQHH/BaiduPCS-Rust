@@ -336,7 +336,16 @@ async fn main() -> anyhow::Result<()> {
 
     // 配置中间件层
     let middleware = ServiceBuilder::new()
-        .layer(TraceLayer::new_for_http()) // HTTP 请求日志
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                // QR sign and other credentials may be carried in the query.
+                tracing::debug_span!(
+                    "http_request",
+                    method = %request.method(),
+                    path = request.uri().path()
+                )
+            },
+        ))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -349,6 +358,7 @@ async fn main() -> anyhow::Result<()> {
         // 认证API
         .route("/auth/qrcode/generate", post(handlers::generate_qrcode))
         .route("/auth/qrcode/status", get(handlers::qrcode_status))
+        .route("/auth/qrcode/cancel", post(handlers::cancel_qrcode))
         .route("/auth/cookie/login", post(handlers::cookie_login))
         .route("/auth/user", get(handlers::get_current_user))
         .route("/auth/logout", post(handlers::logout))

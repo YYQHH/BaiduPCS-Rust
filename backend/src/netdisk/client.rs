@@ -20,7 +20,7 @@ use reqwest::multipart;
 use reqwest::Client;
 use serde_json::Value;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 /// 分块删除时单次删除请求最多包含的文件数。
 ///
@@ -62,11 +62,116 @@ fn connect_timeout_secs() -> u64 {
         .unwrap_or(CONNECT_TIMEOUT_SECS)
 }
 
+async fn execute_warmup_request(
+    _client: &reqwest::Client,
+    req: reqwest::RequestBuilder,
+    step: &str,
+    route: &str,
+    panpsc_storage: &std::sync::Arc<Mutex<Option<String>>>,
+) -> Result<String> {
+    let started = std::time::Instant::now();
+    let target = req
+        .try_clone()
+        .and_then(|r| r.build().ok())
+        .map(|r| {
+            format!(
+                "{}{}",
+                r.url().host_str().unwrap_or("unknown"),
+                r.url().path()
+            )
+        })
+        .unwrap_or_default();
+    info!(step, purpose = "control", target, route, "预热请求开始");
+    let resp = req.send().await.map_err(|e| {
+        let category = if e.is_timeout() {
+            "timeout"
+        } else if e.is_connect() {
+            "connect/tls/dns"
+        } else {
+            "request"
+        };
+        warn!(
+            step,
+            target,
+            route,
+            category,
+            elapsed_ms = started.elapsed().as_millis(),
+            "预热请求失败"
+        );
+        anyhow::anyhow!("{} {}: {}", step, category, e.without_url())
+    })?;
+    let status = resp.status();
+    let final_url = resp.url();
+    info!(step, route, status=%status, host=final_url.host_str(), path=final_url.path(), elapsed_ms=started.elapsed().as_millis(), "预热响应");
+    if matches!(
+        final_url.host_str(),
+        Some("passport.baidu.com" | "wappass.baidu.com")
+    ) || (step.contains("/disk/home") && final_url.path().starts_with("/login"))
+    {
+        anyhow::bail!("BDUSS 已失效（{} 重定向到登录页）", step);
+    }
+    if !status.is_success() {
+        anyhow::bail!("{} HTTP {}", step, status);
+    }
+    for ck in resp.headers().get_all("set-cookie") {
+        if let Ok(cookie) = ck.to_str() {
+            let mut parts = cookie.split(';');
+            if let Some((name, value)) = parts.next().and_then(|kv| kv.split_once('=')) {
+                let domain = parts
+                    .clone()
+                    .find(|a| a.trim().to_lowercase().starts_with("domain="));
+                let path = parts.find(|a| a.trim().to_lowercase().starts_with("path="));
+                debug!(
+                    step,
+                    name,
+                    length = value.len(),
+                    ?domain,
+                    ?path,
+                    "预热 Set-Cookie"
+                );
+                if name == "PANPSC" && !value.is_empty() {
+                    *panpsc_storage.lock().await = Some(value.to_string());
+                }
+            }
+        }
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| anyhow::anyhow!("{} body: {}", step, e.without_url()))?;
+    info!(
+        step,
+        route,
+        elapsed_ms = started.elapsed().as_millis(),
+        bytes = body.len(),
+        "预热请求完成"
+    );
+
+    // 若返回登录页则说明 BDUSS 失效
+    if body.contains("passport.baidu.com") && body.contains("登录") {
+        anyhow::bail!("BDUSS 已失效（{} 响应出现登录页）", step);
+    }
+
+    Ok(body)
+}
+
+async fn bounded_warmup<T>(
+    budget: std::time::Duration,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(budget, work)
+        .await
+        .map_err(|_| anyhow::anyhow!("Web 预热总期限已到（含响应体、重试及退避），请重试"))?
+}
+
 /// 百度网盘客户端
 #[derive(Debug, Clone)]
 pub struct NetdiskClient {
     /// HTTP客户端
     client: Client,
+    transfer_client: Client,
+    #[cfg(test)]
+    control_test_origin: Option<reqwest::Url>,
     /// Cookie Jar (用于调试和检查 Cookie 状态)
     cookie_jar: std::sync::Arc<reqwest::cookie::Jar>,
     /// 用户认证信息
@@ -89,6 +194,21 @@ pub struct NetdiskClient {
 }
 
 impl NetdiskClient {
+    /// Only compiled into tests: exercise production API methods against loopback.
+    #[cfg(test)]
+    fn control_test_url(&self, url: &str) -> String {
+        match &self.control_test_origin {
+            Some(origin) => {
+                let original = reqwest::Url::parse(url).unwrap();
+                let mut target = origin.clone();
+                target.set_path(original.path());
+                target.set_query(original.query());
+                target.to_string()
+            }
+            None => url.to_string(),
+        }
+    }
+
     /// 创建新的网盘客户端
     ///
     /// # 参数
@@ -108,6 +228,15 @@ impl NetdiskClient {
         proxy_config: Option<&ProxyConfig>,
         fallback_mgr: Option<std::sync::Arc<crate::common::ProxyFallbackManager>>,
     ) -> Result<Self> {
+        let direct = ProxyConfig::direct();
+        let proxy_config = if fallback_mgr
+            .as_ref()
+            .is_some_and(|mgr| mgr.is_fallen_back())
+        {
+            Some(&direct)
+        } else {
+            proxy_config
+        };
         use reqwest::cookie::Jar;
         use std::sync::Arc;
 
@@ -166,21 +295,32 @@ impl NetdiskClient {
         // 3. 创建客户端,使用 cookie_provider 自动管理 Cookie
         // 后续请求会自动收集服务器返回的 Set-Cookie
         // 注意: 不要禁用重定向 (Policy::none())，否则 Cookie Jar 可能无法正确携带 Cookie
-        let mut builder = Client::builder()
-            .cookie_provider(Arc::clone(&jar))
-            .timeout(std::time::Duration::from_secs(60))
-            // 建连超时单独设短：Windows 默认 TCP connect 超时约 21s（os error 10060），
-            // 网络抖动时每个请求要白等 21s 才失败，分享同步递归列目录会被整体拖垮。
-            // 8s 连不上就判失败交给上层重试，远比干等划算。
-            .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs()))
-            .redirect(reqwest::redirect::Policy::limited(10)); // 允许最多 10 次重定向
+        let make_builder = || {
+            Client::builder()
+                .cookie_provider(Arc::clone(&jar))
+                .timeout(std::time::Duration::from_secs(60))
+                // 建连超时单独设短：Windows 默认 TCP connect 超时约 21s（os error 10060），
+                // 网络抖动时每个请求要白等 21s 才失败，分享同步递归列目录会被整体拖垮。
+                // 8s 连不上就判失败交给上层重试，远比干等划算。
+                .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs()))
+                .redirect(reqwest::redirect::Policy::limited(10))
+        }; // 允许最多 10 次重定向
 
+        let mut builder = make_builder();
         // 应用代理配置
         if let Some(proxy) = proxy_config {
-            builder = proxy.apply_to_builder(builder)?;
+            builder = proxy.apply_control_to_builder(builder)?;
         }
 
         let client = builder.build().context("Failed to create HTTP client")?;
+        let transfer_client = if let Some(proxy) = proxy_config.filter(|p| p.transfer_only) {
+            proxy
+                .apply_to_builder(make_builder())?
+                .build()
+                .context("Failed to create transfer client")?
+        } else {
+            client.clone()
+        };
 
         info!(
             "初始化网盘客户端成功, UID={}, PTOKEN={}",
@@ -204,6 +344,9 @@ impl NetdiskClient {
 
         Ok(Self {
             client,
+            transfer_client,
+            #[cfg(test)]
+            control_test_origin: None,
             cookie_jar: jar,
             user_auth,
             mobile_user_agent: Self::default_mobile_user_agent(),
@@ -218,14 +361,17 @@ impl NetdiskClient {
 
     /// 创建带代理配置的临时客户端（禁用 cookie_store，手动控制 Cookie）
     fn build_temp_client_with_proxy(&self) -> Result<Client> {
-        let mut builder = Client::builder()
-            .cookie_store(false)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(30))
-            // 与主客户端一致：避免建连阶段干等系统级 21s 超时。
-            .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs()));
+        let make_builder = || {
+            Client::builder()
+                .cookie_store(false)
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(30))
+                // 与主客户端一致：避免建连阶段干等系统级 21s 超时。
+                .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs()))
+        };
+        let mut builder = make_builder();
         if let Some(ref proxy) = self.proxy_config {
-            builder = proxy.apply_to_builder(builder)?;
+            builder = proxy.apply_control_to_builder(builder)?;
         }
         Ok(builder.build()?)
     }
@@ -235,6 +381,24 @@ impl NetdiskClient {
     /// 成功时重置连续失败计数，失败时（仅代理/连接错误）递增失败计数。
     /// 仅在使用代理且未回退到直连时生效。
     fn record_proxy_result(&self, result: &Result<(), &anyhow::Error>) {
+        if !self
+            .proxy_config
+            .as_ref()
+            .is_some_and(ProxyConfig::proxies_control)
+        {
+            return;
+        }
+        self.record_transfer_proxy_result(result);
+    }
+
+    fn record_transfer_proxy_result(&self, result: &Result<(), &anyhow::Error>) {
+        if !self
+            .proxy_config
+            .as_ref()
+            .is_some_and(|p| p.proxy_type != crate::common::ProxyType::None)
+        {
+            return;
+        }
         if let Some(ref mgr) = self.fallback_mgr {
             if mgr.is_fallen_back() {
                 return; // 已回退到直连，不记录
@@ -280,26 +444,24 @@ impl NetdiskClient {
     /// 打印 Cookie Jar 中的 Cookie（用于调试）
     fn debug_print_cookies(&self, context: &str) {
         let url = "https://pan.baidu.com".parse::<reqwest::Url>().unwrap();
-        let cookies = self.cookie_jar.cookies(&url);
-
-        if let Some(cookie_header) = cookies {
-            if let Ok(cookie_str) = cookie_header.to_str() {
-                info!("Cookie Jar 内容 [{}]:", context);
-                // 按分号分割并打印每个 Cookie
-                for cookie in cookie_str.split("; ") {
-                    if cookie.split_once('=').is_some() {
-                        // 对于敏感 Cookie，只显示名称和值的前几个字符
-                        if cookie.len() > 50 {
-                            info!("  {}...", &cookie[..50]);
-                        } else {
-                            info!("  {}", cookie);
-                        }
-                    }
+        if let Some(header) = self.cookie_jar.cookies(&url) {
+            if let Ok(cookies) = header.to_str() {
+                for (name, value) in cookies.split("; ").filter_map(|c| c.split_once('=')) {
+                    debug!(context, name, length = value.len(), "Cookie Jar");
                 }
-                info!("  总共 {} 个 Cookie", cookie_str.split("; ").count());
             }
+        }
+    }
+
+    fn control_route(&self) -> &'static str {
+        if self
+            .proxy_config
+            .as_ref()
+            .is_some_and(ProxyConfig::proxies_control)
+        {
+            "proxy"
         } else {
-            warn!("Cookie Jar 为空 [{}]", context);
+            "direct"
         }
     }
 
@@ -344,174 +506,6 @@ impl NetdiskClient {
         // 提供一个统一的执行器：发送请求 + 检查重定向 + 写 Cookie + 检查登录
         // 注意：使用正常客户端（允许重定向），检查最终 URL 而不是 Location header
         //--------------------------------------------------------------
-        async fn exec_request(
-            _client: &reqwest::Client,
-            req: reqwest::RequestBuilder,
-            step: &str,
-            panpsc_storage: &std::sync::Arc<Mutex<Option<String>>>,
-        ) -> Result<String> {
-            if let Some(cloned_builder) = req.try_clone() {
-                if let Ok(debug_req) = cloned_builder.build() {
-                    let url = debug_req.url().clone();
-                    let ua = debug_req
-                        .headers()
-                        .get("User-Agent")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("<missing>");
-                    let referer = debug_req
-                        .headers()
-                        .get("Referer")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("<missing>");
-                    if step.contains("/disk/home") {
-                        info!(
-                            "{}: 请求头快照 -> UA={}, Referer={}, Cookie={}...",
-                            step,
-                            ua,
-                            referer,
-                            debug_req
-                                .headers()
-                                .get("Cookie")
-                                .and_then(|v| v.to_str().ok())
-                                .map(|v| v.chars().take(120).collect::<String>())
-                                .unwrap_or_else(|| "<missing>".to_string())
-                        );
-                    } else {
-                        debug!("{}: 请求头快照 -> UA={}, Referer={}", step, ua, referer);
-                    }
-                    debug!("{}: 最终请求 URL = {}", step, url);
-                }
-            }
-
-            let resp = req.send().await.context(format!("{} 请求失败", step))?;
-
-            let status = resp.status();
-            let final_url = resp.url().to_string();
-
-            // 检查 Location header（重定向目标）
-            let location = resp.headers().get("location");
-            if let Some(loc) = location {
-                if let Ok(loc_str) = loc.to_str() {
-                    info!("{}: Location header: {}", step, loc_str);
-                    // 如果 Location 指向登录页，说明 BDUSS 失效
-                    if loc_str.contains("passport.baidu.com")
-                        || loc_str.contains("wappass.baidu.com")
-                        || loc_str == "/"
-                    {
-                        anyhow::bail!(
-                            "BDUSS 已失效 ({} Location header 指向登录页: {})",
-                            step,
-                            loc_str
-                        );
-                    }
-                }
-            }
-
-            info!("{}: status={}, final_url={}", step, status, final_url);
-
-            // 检查最终 URL 是否重定向到登录页（代表 BDUSS 失效）
-            // 对于 /disk/home，如果最终 URL 是登录页，说明有问题
-            if step.contains("/disk/home")
-                && (final_url.contains("passport.baidu.com")
-                    || final_url.contains("wappass.baidu.com")
-                    || final_url.contains("pan.baidu.com/login"))
-            {
-                anyhow::bail!(
-                    "BDUSS 已失效或请求参数错误 ({} 最终重定向到 {})",
-                    step,
-                    final_url
-                );
-            }
-
-            // 打印 Set-Cookie 并提取 PANPSC
-            let mut count = 0;
-            for ck in resp.headers().get_all("set-cookie") {
-                if let Ok(s) = ck.to_str() {
-                    let mut parts = s.split(';');
-                    let kv = parts.next().unwrap_or("unknown");
-                    let (name, value_preview) = if let Some((n, v)) = kv.split_once('=') {
-                        (
-                            n,
-                            if v.len() > 60 {
-                                format!("{}...", &v[..60])
-                            } else {
-                                v.to_string()
-                            },
-                        )
-                    } else {
-                        (kv, "<no-value>".to_string())
-                    };
-
-                    let mut domain = "<none>";
-                    let mut path = "<none>";
-                    let mut expires = "<none>";
-                    for attr in parts.clone() {
-                        let attr_trim = attr.trim();
-                        let lower = attr_trim.to_lowercase();
-                        if lower.starts_with("domain=") {
-                            domain = &attr_trim[7..];
-                        } else if lower.starts_with("path=") {
-                            path = &attr_trim[5..];
-                        } else if lower.starts_with("expires=") {
-                            expires = &attr_trim[8..];
-                        } else if lower.starts_with("max-age=") {
-                            expires = attr_trim;
-                        }
-                    }
-
-                    count += 1;
-                    info!(
-                        "{}: Set-Cookie[{}] {}={} (domain={}, path={}, expires={})",
-                        step, count, name, value_preview, domain, path, expires
-                    );
-
-                    if name.eq_ignore_ascii_case("BDUSS") && value_preview.trim().is_empty() {
-                        warn!("{}: 收到清空 BDUSS 的 Set-Cookie！完整内容: {}", step, s);
-                    }
-
-                    if name == "PANPSC" {
-                        if let Some((_, full_value)) = kv.split_once('=') {
-                            if full_value.is_empty() {
-                                warn!("{}: PANPSC Cookie 值为空！完整 Set-Cookie: {}", step, s);
-                            } else {
-                                let mut panpsc = panpsc_storage.lock().await;
-                                *panpsc = Some(full_value.to_string());
-                                info!(
-                                    "{}: 提取到 PANPSC Cookie 值 (长度={}): {}...",
-                                    step,
-                                    full_value.len(),
-                                    &full_value[..full_value.len().min(20)]
-                                );
-                            }
-                        } else {
-                            warn!("{}: PANPSC Set-Cookie 格式错误，未找到 '=': {}", step, s);
-                        }
-                    }
-                }
-            }
-            info!("{}: 本次收到 {} 个 Cookie", step, count);
-
-            let body = resp
-                .text()
-                .await
-                .context(format!("{}: 读取响应失败", step))?;
-
-            // 打印响应体长度（用于调试）
-            info!("{}: 响应体长度: {} 字节", step, body.len());
-
-            // 打印 /api/loginStatus 的完整响应
-            if step.contains("/api/loginStatus") {
-                info!("{}: 完整响应内容: {}", step, body);
-            }
-
-            // 若返回登录页则说明 BDUSS 失效
-            if body.contains("passport.baidu.com") && body.contains("登录") {
-                anyhow::bail!("BDUSS 已失效（{} 响应出现登录页）", step);
-            }
-
-            Ok(body)
-        }
-
         // 使用正常的带 CookieJar 的 Client（允许重定向）
         let client = &self.client;
 
@@ -523,10 +517,14 @@ impl NetdiskClient {
         self.debug_print_cookies("步骤 1/4 前 Cookie 状态");
 
         let simple_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
-        let _body1 = exec_request(
+        let _body1 = execute_warmup_request(
             client,
-            client.get(home_url).header("User-Agent", simple_ua),
+            client
+                .get(home_url)
+                .timeout(std::time::Duration::from_secs(15))
+                .header("User-Agent", simple_ua),
             "步骤 1/4 (/disk/home)",
+            self.control_route(),
             &self.panpsc_cookie,
         )
         .await?;
@@ -544,20 +542,22 @@ impl NetdiskClient {
         );
         self.debug_print_cookies("步骤 2/4 前 Cookie 状态");
 
-        let body2 = exec_request(
+        let body2 = execute_warmup_request(
             client,
             client
                 .get(&login_status_url)
+                .timeout(std::time::Duration::from_secs(15))
                 .header("User-Agent", ua)
                 .header("Referer", referer_home),
             "步骤 2/4 (/api/loginStatus)",
+            self.control_route(),
             &self.panpsc_cookie,
         )
         .await?;
 
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body2) {
             if let Some(bdstoken) = json["login_info"]["bdstoken"].as_str() {
-                info!("步骤 2/4: loginStatus 返回 bdstoken = {}", bdstoken);
+                debug!(length = bdstoken.len(), "loginStatus 已获取 bdstoken");
                 let mut cached = self.bdstoken.lock().await;
                 *cached = Some(bdstoken.to_string());
             } else {
@@ -580,13 +580,15 @@ impl NetdiskClient {
         );
         self.debug_print_cookies("步骤 3/4 前 Cookie 状态");
 
-        let body3 = exec_request(
+        let body3 = execute_warmup_request(
             client,
             client
                 .get(&bdstoken_url)
+                .timeout(std::time::Duration::from_secs(15))
                 .header("User-Agent", ua)
                 .header("Referer", referer_home),
             "步骤 3/4 (/api/gettemplatevariable)",
+            self.control_route(),
             &self.panpsc_cookie,
         )
         .await?;
@@ -594,7 +596,10 @@ impl NetdiskClient {
         // 提取 bdstoken
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body3) {
             if let Some(bdstoken) = json["result"]["bdstoken"].as_str() {
-                info!("步骤 3/4: 成功获取 bdstoken = {}", bdstoken);
+                debug!(
+                    length = bdstoken.len(),
+                    "gettemplatevariable 已获取 bdstoken"
+                );
                 let mut cached = self.bdstoken.lock().await;
                 *cached = Some(bdstoken.to_string());
             } else {
@@ -618,13 +623,15 @@ impl NetdiskClient {
         );
         self.debug_print_cookies("步骤 4/4 前 Cookie 状态");
 
-        let _body4 = exec_request(
+        let _body4 = execute_warmup_request(
             client,
             client
                 .get(&userinfo_url)
+                .timeout(std::time::Duration::from_secs(15))
                 .header("User-Agent", ua)
                 .header("Referer", referer_home),
             "步骤 4/4 (/pcloud/user/getinfo)",
+            self.control_route(),
             &self.panpsc_cookie,
         )
         .await?;
@@ -660,6 +667,21 @@ impl NetdiskClient {
         Option<String>,
         Option<String>,
     )> {
+        bounded_warmup(
+            std::time::Duration::from_secs(45),
+            self.warmup_with_retries(),
+        )
+        .await
+    }
+
+    async fn warmup_with_retries(
+        &self,
+    ) -> Result<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAYS: [u64; 3] = [1, 3, 5]; // 指数退避：1秒、3秒、5秒
 
@@ -688,10 +710,12 @@ impl NetdiskClient {
         }
 
         // 预热前先验证 BDUSS 是否有效
-        if !self.verify_bduss().await {
-            return Err(anyhow::anyhow!("BDUSS 已失效，请重新登录"));
-        }
 
+        // Transport/parse failures remain retryable; only a definite invalid
+        // user response is classified as expired credentials.
+        if !self.verify_bduss().await {
+            anyhow::bail!("BDUSS 已失效，请重新登录");
+        }
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..MAX_RETRIES {
@@ -709,7 +733,15 @@ impl NetdiskClient {
                 self.restore_essential_cookies();
             }
 
-            match self.perform_web_warmup().await {
+            match self
+                .perform_web_warmup()
+                .instrument(tracing::info_span!(
+                    "warmup",
+                    attempt = attempt + 1,
+                    route = self.control_route()
+                ))
+                .await
+            {
                 Ok(()) => {
                     self.record_proxy_success();
                     if attempt > 0 {
@@ -817,7 +849,7 @@ impl NetdiskClient {
 
         let body = resp.text().await.context("fetch_bdstoken: 读取响应失败")?;
 
-        info!("fetch_bdstoken: /api/loginStatus 响应 = {}", body);
+        debug!(bytes = body.len(), "loginStatus 响应已读取");
 
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
             if let Some(token) = json["login_info"]["bdstoken"].as_str() {
@@ -853,7 +885,7 @@ impl NetdiskClient {
             .await
             .context("fetch_bdstoken: 读取 gettemplatevariable 响应失败")?;
 
-        info!("fetch_bdstoken: /api/gettemplatevariable 响应 = {}", body2);
+        debug!(bytes = body2.len(), "gettemplatevariable 响应已读取");
 
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body2) {
             if let Some(token) = json["result"]["bdstoken"].as_str() {
@@ -1051,6 +1083,8 @@ impl NetdiskClient {
         );
 
         let url = "https://pan.baidu.com/rest/2.0/xpan/file";
+        #[cfg(test)]
+        let url = self.control_test_url(&url);
 
         // 仅允许百度支持的三个排序字段，其余回退到 name
         let order = match order {
@@ -1297,10 +1331,12 @@ impl NetdiskClient {
             urlencoding::encode(path),
             sign.url_params()
         );
+        #[cfg(test)]
+        let url = self.control_test_url(&url);
 
-        debug!("Locate 请求 URL: {}", url);
+        debug!("Locate 请求已构造");
         debug!("UID: {}", self.uid());
-        debug!("BDUSS: {}...", &self.bduss()[..20.min(self.bduss().len())]);
+        debug!("Locate 认证已设置");
 
         // 4. 发送 POST 请求
         let response = match self
@@ -1330,10 +1366,12 @@ impl NetdiskClient {
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
             error!(
-                "HTTP 请求失败: status={}, path={}, 响应: {}",
-                status, path, error_text
+                "HTTP 请求失败: status={}, path={}, response_bytes={}",
+                status,
+                path,
+                error_text.len()
             );
-            anyhow::bail!("HTTP 请求失败: {} - {}", status, error_text);
+            anyhow::bail!("HTTP 请求失败: {}", status);
         }
 
         // 6. 解析响应
@@ -1345,14 +1383,16 @@ impl NetdiskClient {
             }
         };
 
-        debug!("响应内容: {}", response_text);
+        debug!(bytes = response_text.len(), "Locate 响应已读取");
 
         let json: serde_json::Value = match serde_json::from_str(&response_text) {
             Ok(j) => j,
             Err(e) => {
                 error!(
-                    "解析 JSON 响应失败: path={}, 错误: {}, 响应: {}",
-                    path, e, response_text
+                    "解析 JSON 响应失败: path={}, 错误: {}, response_bytes={}",
+                    path,
+                    e,
+                    response_text.len()
                 );
                 return Err(e).context("解析 JSON 响应失败");
             }
@@ -1382,8 +1422,9 @@ impl NetdiskClient {
             }
             None => {
                 error!(
-                    "响应中没有 urls 字段: path={}, JSON: {}",
-                    path, response_text
+                    "响应中没有 urls 字段: path={}, response_bytes={}",
+                    path,
+                    response_text.len()
                 );
                 anyhow::bail!("响应中没有 urls 字段");
             }
@@ -1391,8 +1432,9 @@ impl NetdiskClient {
 
         if urls.is_empty() {
             error!(
-                "未找到可用的下载链接: path={}, 响应: {}",
-                path, response_text
+                "未找到可用的下载链接: path={}, response_bytes={}",
+                path,
+                response_text.len()
             );
             anyhow::bail!("未找到可用的下载链接");
         }
@@ -1465,10 +1507,9 @@ impl NetdiskClient {
         }
 
         info!(
-            "选择下载链接 (索引: {}, 总数: {}): {}",
+            "选择下载链接 (索引: {}, 总数: {})",
             selected_index,
-            urls.len(),
-            selected_url
+            urls.len()
         );
 
         Ok(selected_url.clone())
@@ -1498,6 +1539,8 @@ impl NetdiskClient {
         rtype: &str,
     ) -> Result<RapidUploadResponse> {
         let url = "https://pan.baidu.com/api/create";
+        #[cfg(test)]
+        let url = self.control_test_url(&url);
 
         let response = self
             .client
@@ -1587,6 +1630,8 @@ impl NetdiskClient {
              app_id={}",
             BAIDU_APP_ID
         );
+        #[cfg(test)]
+        let url = self.control_test_url(&url);
 
         let response = self
             .client
@@ -1668,6 +1713,8 @@ impl NetdiskClient {
         );
 
         let url = "https://pan.baidu.com/api/precreate";
+        #[cfg(test)]
+        let url = self.control_test_url(&url);
 
         let response = self
             .client
@@ -1779,23 +1826,16 @@ impl NetdiskClient {
 
         let form = multipart::Form::new().part("file", part);
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Cookie", self.bduss_cookie_header())
-            .header("User-Agent", &self.mobile_user_agent)
-            .multipart(form)
-            .send()
-            .await;
+        let response = self.send_upload_chunk(&url, form).await;
 
         let response = match response {
             Ok(resp) => {
-                self.record_proxy_success();
+                self.record_transfer_proxy_result(&Ok(()));
                 resp
             }
             Err(e) => {
                 let err = anyhow::Error::from(e).context("上传分片请求发送失败");
-                self.record_proxy_failure(&err);
+                self.record_transfer_proxy_result(&Err(&err));
                 return Err(err);
             }
         };
@@ -1850,6 +1890,20 @@ impl NetdiskClient {
         );
 
         Ok(chunk_response)
+    }
+
+    async fn send_upload_chunk(
+        &self,
+        url: &str,
+        form: multipart::Form,
+    ) -> reqwest::Result<reqwest::Response> {
+        self.transfer_client
+            .post(url)
+            .header("Cookie", self.bduss_cookie_header())
+            .header("User-Agent", &self.mobile_user_agent)
+            .multipart(form)
+            .send()
+            .await
     }
 
     // /// 创建文件（合并分片，完成上传）
@@ -2063,6 +2117,8 @@ impl NetdiskClient {
             BAIDU_APP_ID,
             urlencoding::encode(&bdstoken),
         );
+        #[cfg(test)]
+        let url = self.control_test_url(&url);
         info!("创建文件夹: 使用 bdstoken 参数");
 
         debug!("创建文件夹 URL: {}", url);
@@ -2174,6 +2230,11 @@ impl NetdiskClient {
         &self,
         req: crate::netdisk::share::ShareHttpRequest<'_>,
     ) -> Result<String> {
+        #[cfg(test)]
+        let req = crate::netdisk::share::ShareHttpRequest {
+            url: self.control_test_url(&req.url),
+            ..req
+        };
         let use_temp_client = req.cookie_randsk.is_some_and(|s| !s.is_empty());
 
         // 覆盖 randsk 时必须用临时客户端：主客户端共享 Cookie Jar，
@@ -3808,6 +3869,8 @@ impl NetdiskClient {
         let path_list = serde_json::to_string(paths).context("序列化路径列表失败")?;
 
         let url = "https://pan.baidu.com/share/pset";
+        #[cfg(test)]
+        let url = self.control_test_url(&url);
 
         let response = self
             .client
@@ -3879,6 +3942,8 @@ impl NetdiskClient {
         let shareid_list = serde_json::to_string(share_ids).context("序列化分享ID列表失败")?;
 
         let url = "https://pan.baidu.com/share/cancel";
+        #[cfg(test)]
+        let url = self.control_test_url(&url);
 
         let response = self
             .client
@@ -3921,8 +3986,11 @@ impl NetdiskClient {
         use crate::netdisk::share_expire::{build_mexpire_form, mexpire_query};
 
         let form = build_mexpire_form(share_id, days, now)?;
+        let url = "https://pan.baidu.com/share/mexpire";
+        #[cfg(test)]
+        let url = self.control_test_url(&url);
         self.client
-            .post("https://pan.baidu.com/share/mexpire")
+            .post(url)
             .query(&mexpire_query())
             .header("Cookie", self.bduss_cookie_header())
             .header("User-Agent", &self.web_user_agent)
@@ -3998,6 +4066,8 @@ impl NetdiskClient {
         info!("获取分享列表: page={}", page);
 
         let url = "https://pan.baidu.com/share/record";
+        #[cfg(test)]
+        let url = self.control_test_url(&url);
         let page_str = page.to_string();
 
         let response = self
@@ -4064,6 +4134,8 @@ impl NetdiskClient {
         let sign = crate::sign::share_surl_info_sign(share_id);
 
         let url = "https://pan.baidu.com/share/surlinfoinrecord";
+        #[cfg(test)]
+        let url = self.control_test_url(&url);
 
         let response = self
             .client
@@ -4169,6 +4241,8 @@ impl NetdiskClient {
             urlencoding::encode(&bdstoken),
             BAIDU_APP_ID
         );
+        #[cfg(test)]
+        let url = self.control_test_url(&url);
 
         // 收集 cookies 并创建独立 client（与 create_folder 一致）
         let merged_cookie_str = self.collect_all_baidu_cookies().await?;
@@ -6041,5 +6115,29 @@ mod transfer_preservation_tests {
         assert_eq!(r.task_errno, 132);
         let aw = r.authwidget.expect("authwidget 必须解析出来");
         assert_eq!(aw.safesign.as_deref(), Some("x"));
+    }
+}
+
+#[cfg(test)]
+#[path = "proxy_tests.rs"]
+mod proxy_tests;
+
+#[cfg(test)]
+mod warmup_budget_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn total_deadline_includes_retry_backoff() {
+        let started = std::time::Instant::now();
+        let result = bounded_warmup(std::time::Duration::from_millis(80), async {
+            for _ in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+            Ok(())
+        })
+        .await;
+        assert!(result.unwrap_err().to_string().contains("总期限"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

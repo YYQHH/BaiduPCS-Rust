@@ -9,6 +9,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 /// 二维码登录客户端
+#[derive(Clone)]
 pub struct QRCodeAuth {
     client: Client,
     baiduid: std::sync::Arc<std::sync::Mutex<Option<String>>>, // 存储从 fetch_qrcode_sign 获取的 BAIDUID
@@ -24,10 +25,12 @@ impl QRCodeAuth {
     pub fn new_with_proxy(proxy_config: Option<&ProxyConfig>) -> Result<Self> {
         let mut builder = Client::builder()
             .cookie_store(true)
+            .connect_timeout(std::time::Duration::from_secs(8))
+            .timeout(std::time::Duration::from_secs(15))
             .user_agent(USER_AGENT);
 
         if let Some(proxy) = proxy_config {
-            builder = proxy.apply_to_builder(builder)?;
+            builder = proxy.apply_control_to_builder(builder)?;
         }
 
         let client = builder
@@ -48,7 +51,7 @@ impl QRCodeAuth {
 
         // 步骤1: 获取二维码sign
         let (sign, _api_url) = self.fetch_qrcode_sign().await?;
-        debug!("获取到二维码 sign: {}", sign);
+        debug!("已获取二维码 sign");
 
         // 步骤2: 构建百度二维码图片API的URL
         // 使用 lp=mobile 让二维码支持APP扫描
@@ -56,7 +59,7 @@ impl QRCodeAuth {
             "{}?sign={}&lp=mobile&qrloginfrom=mobile&tpl={}",
             API_QRCODE_IMAGE, sign, APP_TEMPLATE
         );
-        debug!("二维码图片URL: {}", qrcode_image_url);
+        debug!("已构造二维码图片请求");
 
         // 步骤3: 下载百度生成的二维码图片并转为base64
         // 百度返回的PNG图片中已经包含了正确的登录确认页面URL
@@ -80,7 +83,7 @@ impl QRCodeAuth {
     ///
     /// 返回: UserAuth (包含完整的用户信息)
     async fn confirm_qrcode_login(&self, v_code: &str, _sign: &str) -> Result<UserAuth> {
-        info!("调用确认登录接口，v = {}", v_code);
+        info!("调用确认登录接口");
 
         // 构建确认登录接口URL
         let timestamp = chrono::Utc::now().timestamp_millis();
@@ -97,7 +100,7 @@ impl QRCodeAuth {
             timestamp
         );
 
-        debug!("确认登录URL: {}", url);
+        debug!("确认登录请求已构造");
 
         // 调用接口
         let resp = self
@@ -106,6 +109,7 @@ impl QRCodeAuth {
             .header("User-Agent", USER_AGENT)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Failed to confirm qrcode login")?;
 
         // 提取 Set-Cookie 中的所有重要 Cookie
@@ -133,7 +137,10 @@ impl QRCodeAuth {
         // 遍历所有的 Set-Cookie 响应头
         for cookie_header in resp.headers().get_all("set-cookie") {
             let cookie_str = cookie_header.to_str().unwrap_or("");
-            info!("  Set-Cookie: {}", cookie_str);
+            debug!(
+                name = cookie_str.split('=').next().unwrap_or(""),
+                "收到登录 Cookie"
+            );
 
             // 提取 Cookie 的 name=value 部分 (第一个分号之前)
             if let Some(semicolon_pos) = cookie_str.find(';') {
@@ -199,7 +206,7 @@ impl QRCodeAuth {
         }
 
         info!("Cookie 提取结果:");
-        info!("  BDUSS: {}...", &bduss[..20.min(bduss.len())]);
+        debug!(length = bduss.len(), "已获取 BDUSS");
         info!(
             "  STOKEN: {}",
             if !stoken.is_empty() {
@@ -312,13 +319,17 @@ impl QRCodeAuth {
             .header("User-Agent", USER_AGENT)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Failed to fetch qrcode sign")?;
 
         // 打印响应头,查看是否有 BAIDUID
         info!("获取二维码 sign 的响应头:");
         for cookie_header in resp.headers().get_all("set-cookie") {
             if let Ok(cookie_str) = cookie_header.to_str() {
-                info!("  Set-Cookie: {}", cookie_str);
+                debug!(
+                    name = cookie_str.split('=').next().unwrap_or(""),
+                    "收到二维码 Cookie"
+                );
 
                 // 提取 BAIDUID
                 if cookie_str.contains("BAIDUID=") {
@@ -326,10 +337,7 @@ impl QRCodeAuth {
                         let value_part = &cookie_str[start + 8..]; // "BAIDUID=" 长度为 8
                         if let Some(end) = value_part.find(';') {
                             let baiduid_value = value_part[..end].to_string();
-                            info!(
-                                "提取到 BAIDUID: {}...",
-                                &baiduid_value[..20.min(baiduid_value.len())]
-                            );
+                            debug!(length = baiduid_value.len(), "已提取 BAIDUID");
                             *self.baiduid.lock().unwrap() = Some(baiduid_value);
                         }
                     }
@@ -367,7 +375,7 @@ impl QRCodeAuth {
 
     /// 下载百度生成的二维码图片并转为Base64编码
     async fn download_qrcode_image(&self, url: &str) -> Result<String> {
-        debug!("下载二维码图片: {}", url);
+        debug!("下载二维码图片");
 
         // 下载二维码图片
         let resp = self
@@ -376,12 +384,14 @@ impl QRCodeAuth {
             .header("User-Agent", USER_AGENT)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Failed to download QR code image")?;
 
         // 获取图片数据
         let image_bytes = resp
             .bytes()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Failed to read QR code image bytes")?;
 
         // 转换为Base64
@@ -424,7 +434,7 @@ impl QRCodeAuth {
     ///
     /// 查询用户是否扫码及登录状态
     pub async fn poll_status(&self, sign: &str) -> Result<QRCodeStatus> {
-        debug!("轮询二维码状态: {}", sign);
+        debug!("轮询二维码状态");
 
         let url = format!(
             "{}?channel_id={}&tpl={}&apiver={}&tt={}",
@@ -440,41 +450,35 @@ impl QRCodeAuth {
             .get(&url)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Failed to poll qrcode status")?;
 
         // 打印响应头，查看是否有 Set-Cookie
-        if let Some(cookies) = resp.headers().get("set-cookie") {
-            info!("响应中的 Set-Cookie: {:?}", cookies);
+        if resp.headers().contains_key("set-cookie") {
+            debug!("轮询响应包含 Set-Cookie");
         }
 
         let json: Value = resp
             .json()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Failed to parse status response")?;
 
         // 打印完整的响应内容，用于调试
-        info!(
-            "轮询接口返回: {}",
-            serde_json::to_string_pretty(&json).unwrap_or_default()
-        );
+        debug!("已解析轮询响应");
 
         // 解析 channel_v 中的状态
         // channel_v 是一个 JSON 字符串，需要再次解析
         let channel_v_str = json["channel_v"].as_str().unwrap_or("{}");
 
-        info!("channel_v 原始字符串: {}", channel_v_str);
+        debug!(length = channel_v_str.len(), "已收到 channel_v");
 
         let channel_v: Value =
             serde_json::from_str(channel_v_str).unwrap_or_else(|_| serde_json::json!({}));
 
         let status = channel_v["status"].as_i64().unwrap_or(0);
         let v_code = channel_v["v"].as_str().unwrap_or("");
-        info!(
-            "扫码状态: status = {}, v = {}, 完整 channel_v: {}",
-            status,
-            v_code,
-            serde_json::to_string_pretty(&channel_v).unwrap_or_default()
-        );
+        info!(status, has_confirmation = !v_code.is_empty(), "扫码状态");
 
         // 判断登录状态的正确逻辑：
         // 1. status = 0 且没有 v 字段 → 等待扫码
@@ -483,7 +487,7 @@ impl QRCodeAuth {
 
         if !v_code.is_empty() {
             // 有 v 字段，说明用户已确认登录
-            info!("用户确认登录成功，v = {}", v_code);
+            info!("用户确认登录成功");
 
             // 调用确认登录接口，获取真正的 BDUSS 和用户信息
             match self.confirm_qrcode_login(v_code, sign).await {
@@ -609,15 +613,13 @@ impl QRCodeAuth {
             .header("User-Agent", USER_AGENT)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Failed to fetch user info")?;
 
         let json: Value = resp.json().await.context("Failed to parse user info")?;
 
         // 打印返回的JSON，用于调试
-        info!(
-            "网盘API返回: {}",
-            serde_json::to_string_pretty(&json).unwrap_or_default()
-        );
+        debug!("已解析网盘用户信息响应");
 
         // 用户信息在 user_info 字段下
         let user_info = &json["user_info"];

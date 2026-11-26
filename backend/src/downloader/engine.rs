@@ -1269,6 +1269,15 @@ impl DownloadEngine {
         proxy_config: Option<&ProxyConfig>,
         fallback_mgr: Option<Arc<crate::common::ProxyFallbackManager>>,
     ) -> Self {
+        let direct = ProxyConfig::direct();
+        let proxy_config = if fallback_mgr
+            .as_ref()
+            .is_some_and(|mgr| mgr.is_fallen_back())
+        {
+            Some(&direct)
+        } else {
+            proxy_config
+        };
         // 基础HTTP客户端，使用较长的超时时间以支持大分片下载
         // 实际超时会在每个请求中根据分片大小动态调整
         let client = Client::builder()
@@ -1310,7 +1319,7 @@ impl DownloadEngine {
     /// # 参数
     /// - `proxy_config`: 代理配置
     /// - `force_http11`: 是否强制 HTTP/1.1（HTTP/2 降级期间为 true）
-    fn build_download_client(
+    pub(crate) fn build_download_client(
         proxy_config: Option<&ProxyConfig>,
         force_http11: bool,
     ) -> Result<Client> {

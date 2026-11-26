@@ -334,6 +334,7 @@ pub struct AppState {
     pub cloud_dl_init_locks: Arc<tokio::sync::Mutex<HashMap<Uid, Arc<tokio::sync::Mutex<()>>>>>,
     /// 🔥 代理故障回退管理器
     pub fallback_mgr: Arc<ProxyFallbackManager>,
+    pub login_attempts: Arc<super::handlers::auth::LoginAttempts>,
     /// 🔥 扫描管理器（用户登录后创建）
     pub scan_manager: Arc<RwLock<Option<Arc<ScanManager>>>>,
     /// 多账号资源配额调度器
@@ -624,6 +625,7 @@ impl AppState {
         crate::notification::apply_config(&config.notification);
 
         let state = Self {
+            login_attempts: Arc::new(Default::default()),
             qrcode_auth: Arc::new(RwLock::new(QRCodeAuth::new_with_proxy(proxy_config)?)),
             account_manager,
             client_pool,
@@ -685,20 +687,17 @@ impl AppState {
         };
 
         // session_manager 仍保留为旧字段（过渡期），但不再读 session.json
-        let _session_manager_guard = self.session_manager.lock().await;
         if let Some(mut user_auth) = active_user_opt {
             *self.current_user.write().await = Some(user_auth.clone());
 
             // 初始化网盘客户端
             let config_guard = self.config.read().await;
-            let proxy_config_for_client = if config_guard.network.proxy.proxy_type
-                != ProxyType::None
-                && !self.fallback_mgr.is_fallen_back()
-            {
-                Some(config_guard.network.proxy.clone())
-            } else {
-                None
-            };
+            let proxy_config_for_client =
+                if config_guard.network.proxy.proxy_type != ProxyType::None {
+                    Some(config_guard.network.proxy.clone())
+                } else {
+                    None
+                };
             drop(config_guard);
 
             let fallback_for_client = if proxy_config_for_client.is_some() {
@@ -1723,7 +1722,6 @@ impl AppState {
                     let config_guard = self.config.read().await;
                     let proxy = if config_guard.network.proxy.proxy_type
                         != crate::common::ProxyType::None
-                        && !self.fallback_mgr.is_fallen_back()
                     {
                         Some(config_guard.network.proxy.clone())
                     } else {
@@ -2641,9 +2639,7 @@ impl AppState {
         // 1) 取代理配置（与 active 账号同款）
         let proxy_config = {
             let cfg = self.config.read().await;
-            if cfg.network.proxy.proxy_type != ProxyType::None
-                && !self.fallback_mgr.is_fallen_back()
-            {
+            if cfg.network.proxy.proxy_type != ProxyType::None {
                 Some(cfg.network.proxy.clone())
             } else {
                 None
@@ -3257,9 +3253,7 @@ impl AppState {
         // 读取代理配置
         let proxy_config = {
             let config_guard = self.config.read().await;
-            if config_guard.network.proxy.proxy_type != ProxyType::None
-                && !self.fallback_mgr.is_fallen_back()
-            {
+            if config_guard.network.proxy.proxy_type != ProxyType::None {
                 Some(config_guard.network.proxy.clone())
             } else {
                 None
@@ -3354,9 +3348,7 @@ impl AppState {
         // 3) 构造代理配置（与 preheat_inactive_clients 同款）
         let proxy_config = {
             let config_guard = self.config.read().await;
-            if config_guard.network.proxy.proxy_type != ProxyType::None
-                && !self.fallback_mgr.is_fallen_back()
-            {
+            if config_guard.network.proxy.proxy_type != ProxyType::None {
                 Some(config_guard.network.proxy.clone())
             } else {
                 None
@@ -3456,59 +3448,55 @@ impl ProxyHotUpdater for AppState {
     }
 
     async fn update_netdisk_client(&self, proxy: Option<&ProxyConfig>) -> anyhow::Result<()> {
-        // 按 active_uid → AccountManager 取，不用 current_user
-        let user_auth = self.active_user_auth().await;
-        if let Some(user) = user_auth {
-            let new_client =
+        let users = self.account_manager.lock().await.list_users().to_vec();
+        for user in users {
+            let uid = Uid::new(user.uid);
+            let client =
                 NetdiskClient::new_with_proxy(user, proxy, Some(Arc::clone(&self.fallback_mgr)))?;
-            *self.netdisk_client.write().await = Some(new_client);
+            self.client_pool
+                .write()
+                .await
+                .add_client(uid, Arc::new(client.clone()));
+            if *self.active_uid.read().await == Some(uid) {
+                *self.netdisk_client.write().await = Some(client);
+            }
         }
         Ok(())
     }
 
     async fn update_download_engine(&self, proxy: Option<&ProxyConfig>) {
-        if let Some(dm) = self.download_manager_for_active().await {
-            dm.update_proxy_config(proxy);
+        for (_, manager) in self.list_download_managers() {
+            manager.update_proxy_config(proxy);
         }
     }
 
     async fn update_upload_engine(&self, proxy: Option<&ProxyConfig>) {
-        if let Some(um) = self.upload_manager_for_active().await {
-            // 按 active_uid → AccountManager 取，不用 current_user
-            let user_auth = self.active_user_auth().await;
-            if let Some(user) = user_auth {
+        for (uid, manager) in self.list_upload_managers() {
+            let user = self.account_manager.lock().await.get_user(uid).cloned();
+            if let Some(user) = user {
                 match NetdiskClient::new_with_proxy(
                     user,
                     proxy,
                     Some(Arc::clone(&self.fallback_mgr)),
                 ) {
-                    Ok(new_client) => {
-                        um.update_netdisk_client(new_client);
-                    }
-                    Err(e) => {
-                        tracing::warn!("UploadManager NetdiskClient 热更新失败: {}", e);
-                    }
+                    Ok(client) => manager.update_netdisk_client(client),
+                    Err(e) => warn!("UploadManager uid={} hot update failed: {}", uid.raw(), e),
                 }
             }
         }
     }
 
     async fn update_transfer_engine(&self, proxy: Option<&ProxyConfig>) {
-        if let Some(tm) = self.transfer_manager_for_active().await {
-            // 按 active_uid → AccountManager 取，不用 current_user
-            let user_auth = self.active_user_auth().await;
-            if let Some(user) = user_auth {
+        for (uid, manager) in self.list_transfer_managers() {
+            let user = self.account_manager.lock().await.get_user(uid).cloned();
+            if let Some(user) = user {
                 match NetdiskClient::new_with_proxy(
                     user,
                     proxy,
                     Some(Arc::clone(&self.fallback_mgr)),
                 ) {
-                    Ok(new_client) => {
-                        tm.update_netdisk_client(new_client);
-                    }
-                    Err(e) => {
-                        tracing::warn!("TransferManager NetdiskClient 热更新失败: {}", e);
-                    }
+                    Ok(client) => manager.update_netdisk_client(client),
+                    Err(e) => warn!("TransferManager uid={} hot update failed: {}", uid.raw(), e),
                 }
             }
         }
@@ -3573,8 +3561,8 @@ impl ProxyHotUpdater for AppState {
     }
 
     async fn update_autobackup_manager(&self, proxy: Option<&ProxyConfig>) {
-        if let Some(mgr) = self.autobackup_manager_for_active().await {
-            mgr.update_proxy_config(proxy);
+        for (_, manager) in self.list_autobackup_managers() {
+            manager.update_proxy_config(proxy);
         }
     }
 }

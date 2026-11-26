@@ -367,6 +367,7 @@ impl From<&UserAuth> for PublicUserInfo {
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum QRCodeStatusResponse {
     Waiting,
+    Initializing,
     Scanned,
     Success { user: PublicUserInfo },
     Expired,

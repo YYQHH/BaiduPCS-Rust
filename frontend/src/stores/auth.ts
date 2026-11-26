@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { generateQRCode as apiGenerateQRCode, getQRCodeStatus, getCurrentUser, logout as apiLogout, cookieLogin as apiCookieLogin } from '@/api/auth'
+import { generateQRCode as apiGenerateQRCode, cancelQRCode, getQRCodeStatus, getCurrentUser, logout as apiLogout, cookieLogin as apiCookieLogin } from '@/api/auth'
 import type { QRCode, UserAuth, CookieLoginResult } from '@/api/auth'
 import {
   listAccounts as apiListAccounts,
@@ -34,6 +34,8 @@ export const useAuthStore = defineStore('auth', () => {
   const qrcode = ref<QRCode | null>(null)
   const isPolling = ref(false)
   const pollingTimer = ref<number | null>(null)
+  let pollingGeneration = 0
+  let qrGeneration = 0
 
   // ───────── 多账号字段（新增） ─────────
   /** 全账号摘要 */
@@ -96,8 +98,12 @@ export const useAuthStore = defineStore('auth', () => {
   // 生成二维码
   async function generateQRCode(): Promise<QRCode> {
     try {
-      qrcode.value = await apiGenerateQRCode()
-      return qrcode.value
+      const generation = ++qrGeneration
+      const previousSign = qrcode.value?.sign
+      stopPolling()
+      const next = await apiGenerateQRCode(previousSign)
+      if (generation === qrGeneration) qrcode.value = next
+      return next
     } catch (error) {
       console.error('生成二维码失败:', error)
       throw error
@@ -114,6 +120,8 @@ export const useAuthStore = defineStore('auth', () => {
     if (isPolling.value || !qrcode.value) return
 
     isPolling.value = true
+    const generation = ++pollingGeneration
+    const sign = qrcode.value.sign
 
     const poll = async () => {
       try {
@@ -122,22 +130,27 @@ export const useAuthStore = defineStore('auth', () => {
           return
         }
 
-        const status = await getQRCodeStatus(qrcode.value.sign, addMode)
+        const status = await getQRCodeStatus(sign, addMode)
+        if (generation !== pollingGeneration || !isPolling.value) return
 
         switch (status.status) {
           case 'success':
             // 登录成功
-            stopPolling()
+            if (pollingTimer.value) clearTimeout(pollingTimer.value)
+            isPolling.value = false
             try {
-              await fetchUserInfo()
+              const current = await getCurrentUser()
+              if (generation !== pollingGeneration) return
+              user.value = current
             } catch (error) {
+              if (generation !== pollingGeneration) return
               console.error('获取用户信息失败，但登录成功:', error)
               // 即使获取失败，也设置基本用户信息
               if (status.user) {
                 user.value = status.user
               }
             }
-            onSuccess()
+            if (generation === pollingGeneration) onSuccess()
             break
           case 'expired':
             // 二维码过期
@@ -154,26 +167,35 @@ export const useAuthStore = defineStore('auth', () => {
             console.log('已扫码，等待确认...')
             onScanned?.()
             break
+          case 'initializing':
           case 'waiting':
             // 等待扫码
             console.log('等待扫码...')
             break
         }
       } catch (error) {
-        console.error('轮询失败:', error)
-        // 继续轮询，不停止
+        if (generation !== pollingGeneration) return
+        stopPolling()
+        onError(error)
+      } finally {
+        if (generation === pollingGeneration && isPolling.value) {
+          pollingTimer.value = window.setTimeout(poll, 3000)
+        }
       }
     }
 
     // 开始轮询
     poll()
-    pollingTimer.value = window.setInterval(poll, 3000)
   }
 
   // 停止轮询
   function stopPolling() {
+    if (isPolling.value && qrcode.value) {
+      void cancelQRCode(qrcode.value.sign).catch(() => {})
+    }
+    ++pollingGeneration
     if (pollingTimer.value) {
-      clearInterval(pollingTimer.value)
+      clearTimeout(pollingTimer.value)
       pollingTimer.value = null
     }
     isPolling.value = false
@@ -203,6 +225,8 @@ export const useAuthStore = defineStore('auth', () => {
 
   // 登出
   async function logout() {
+    stopPolling()
+    ++qrGeneration
     try {
       await apiLogout()
       user.value = null
@@ -258,6 +282,8 @@ export const useAuthStore = defineStore('auth', () => {
    * 重，避免同一次切换触发两次刷新。
    */
   async function switchAccount(uid: number): Promise<void> {
+    stopPolling()
+    ++qrGeneration
     const resp = await apiSwitchAccount(uid)
     activeUid.value = resp.active_uid
     // 同步 accounts 中各项 is_active 字段

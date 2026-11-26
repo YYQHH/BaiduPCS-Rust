@@ -84,6 +84,7 @@ pub async fn switch_account(
     State(state): State<AppState>,
     Json(body): Json<SwitchAccountRequest>,
 ) -> ApiResult<Json<SwitchAccountResponse>> {
+    state.login_attempts.cancel_all();
     let target_uid = Uid::new(body.uid);
 
     // 校验目标账号存在

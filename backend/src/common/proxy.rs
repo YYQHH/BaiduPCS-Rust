@@ -20,7 +20,7 @@ pub enum ProxyType {
 
 
 /// 代理配置
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProxyConfig {
     #[serde(default)]
     pub proxy_type: ProxyType,
@@ -36,6 +36,23 @@ pub struct ProxyConfig {
     /// 设为 false 适用于内网环境中直连本身不通的场景
     #[serde(default = "default_allow_fallback")]
     pub allow_fallback: bool,
+    /// Only file content uses the proxy; authentication and metadata connect directly.
+    #[serde(default)]
+    pub transfer_only: bool,
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("proxy_type", &self.proxy_type)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("has_username", &self.username.is_some())
+            .field("has_password", &self.password.is_some())
+            .field("allow_fallback", &self.allow_fallback)
+            .field("transfer_only", &self.transfer_only)
+            .finish()
+    }
 }
 
 fn default_allow_fallback() -> bool {
@@ -51,11 +68,32 @@ impl Default for ProxyConfig {
             username: None,
             password: None,
             allow_fallback: true,
+            transfer_only: false,
         }
     }
 }
 
 impl ProxyConfig {
+    /// An explicit direct route, also suppressing system/environment proxies.
+    pub fn direct() -> Self {
+        Self {
+            transfer_only: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn apply_control_to_builder(&self, builder: ClientBuilder) -> Result<ClientBuilder> {
+        if self.transfer_only {
+            Ok(builder.no_proxy())
+        } else {
+            self.apply_to_builder(builder)
+        }
+    }
+
+    pub fn proxies_control(&self) -> bool {
+        self.proxy_type != ProxyType::None && !self.transfer_only
+    }
+
     /// 规范化可选字符串：`Some("")` 视为 `None`，`Some(s)` 去除首尾空白
     fn normalize_optional(s: &Option<String>) -> Option<&str> {
         s.as_deref().map(|v| v.trim()).filter(|v| !v.is_empty())
@@ -138,7 +176,8 @@ impl ProxyConfig {
         }
 
         let url = self.build_proxy_url()?;
-        let mut proxy = reqwest::Proxy::all(&url)?;
+        let mut proxy = reqwest::Proxy::all(&url)
+            .map_err(|_| anyhow::anyhow!("无法构建代理，请检查代理类型、地址和端口"))?;
 
         // HTTP 认证通过 basic_auth 设置
         if self.proxy_type == ProxyType::Http {
@@ -160,6 +199,7 @@ impl ProxyConfig {
     pub fn apply_to_builder(&self, builder: ClientBuilder) -> Result<ClientBuilder> {
         match self.to_reqwest_proxy()? {
             Some(proxy) => Ok(builder.proxy(proxy)),
+            None if self.transfer_only => Ok(builder.no_proxy()),
             None => Ok(builder),
         }
     }

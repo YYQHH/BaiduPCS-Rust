@@ -4,6 +4,7 @@ import ElementPlus from 'element-plus'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 import SettingsView from '../SettingsView.vue'
+import { updateTransferConfig } from '@/api/config'
 
 const configApi = vi.hoisted(() => ({
   getConfig: vi.fn(),
@@ -53,6 +54,7 @@ vi.mock('@/stores/config', () => ({
   useConfigStore: () => ({
     config: null,
     fetchConfig: async () => configApi.getConfig(),
+    saveConfig: async (config: unknown) => configApi.updateConfig(config),
   }),
 }))
 
@@ -387,6 +389,82 @@ describe('SettingsView 上传：跳过秒传', () => {
     sw.click()
     await flushPromises()
     expect((wrapper.vm as any).formData.upload.skip_rapid_upload).toBe(true)
+    wrapper.unmount()
+  })
+})
+
+describe('SettingsView 仅代理文件数据', () => {
+  function proxySwitch(): HTMLElement {
+    const item = Array.from(document.querySelectorAll<HTMLElement>('.el-form-item')).find(
+      el => el.querySelector('.el-form-item__label')?.textContent?.trim() === '仅代理上传下载链路',
+    )!
+    return item.querySelector<HTMLElement>('.el-switch')!
+  }
+
+  it('旧配置默认关闭，无代理时禁用；保留已保存的选择', async () => {
+    let wrapper = await mountSettings()
+    expect(proxySwitch().classList.contains('is-checked')).toBe(false)
+    expect(proxySwitch().classList.contains('is-disabled')).toBe(true)
+    wrapper.unmount()
+    configApi.getConfig.mockResolvedValue({
+      ...JSON.parse(JSON.stringify(BASE_CONFIG)),
+      network: { proxy: { proxy_type: 'none', transfer_only: true } },
+    })
+    wrapper = await mountSettings()
+    expect(proxySwitch().classList.contains('is-checked')).toBe(true)
+    expect(proxySwitch().classList.contains('is-disabled')).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('HTTP 和 SOCKS5 均可回显和编辑选择', async () => {
+    for (const proxy_type of ['http', 'socks5']) {
+      configApi.getConfig.mockResolvedValue({
+        ...JSON.parse(JSON.stringify(BASE_CONFIG)),
+        network: { proxy: { proxy_type, host: '127.0.0.1', port: 7890, transfer_only: true,
+          username: 'synthetic-user', password: 'synthetic-password' } },
+      })
+      const wrapper = await mountSettings()
+      expect(proxySwitch().classList.contains('is-checked')).toBe(true)
+      expect(proxySwitch().classList.contains('is-disabled')).toBe(false)
+      proxySwitch().click(); await flushPromises()
+      expect((wrapper.vm as unknown as { proxyTransferOnly: boolean }).proxyTransferOnly).toBe(false)
+      await wrapper.get('#section-proxy input[value="none"]').setValue()
+      const saved = wrapper.vm as unknown as { proxyUsername: string, proxyPassword: string }
+      expect(saved.proxyUsername).toBe('synthetic-user')
+      expect(saved.proxyPassword).toBe('synthetic-password')
+      await flushPromises()
+      wrapper.unmount()
+    }
+  })
+
+  it('保存开关和代理凭证后重新读取确认，保留同时编辑的转存设置', async () => {
+    configApi.getConfig.mockResolvedValue({
+      ...JSON.parse(JSON.stringify(BASE_CONFIG)),
+      network: { proxy: { proxy_type: 'http', host: '127.0.0.1', port: 7890,
+        username: 'synthetic-user', password: 'synthetic-password', transfer_only: false } },
+    })
+    configApi.updateConfig.mockImplementation(async value => {
+      configApi.getConfig.mockResolvedValue(JSON.parse(JSON.stringify(value)))
+      return 'ok'
+    })
+    const wrapper = await mountSettings()
+    const vm = wrapper.vm as unknown as {
+      formRef: { validate: () => Promise<boolean> }
+      proxyTransferOnly: boolean
+      transferBehavior: string
+      handleSave: () => Promise<void>
+    }
+    vi.spyOn(vm.formRef, 'validate').mockResolvedValue(true)
+    vm.proxyTransferOnly = true
+    vm.transferBehavior = 'transfer_and_download'
+    await vm.handleSave()
+    expect(configApi.updateConfig).toHaveBeenCalledWith(expect.objectContaining({
+      network: { proxy: expect.objectContaining({ transfer_only: true,
+        username: 'synthetic-user', password: 'synthetic-password' }) },
+    }))
+    expect(updateTransferConfig).toHaveBeenCalledWith({ default_behavior: 'transfer_and_download' })
+    expect(vm.proxyTransferOnly).toBe(true)
+    await flushPromises()
     wrapper.unmount()
   })
 })
